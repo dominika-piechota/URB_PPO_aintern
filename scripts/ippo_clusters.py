@@ -17,6 +17,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import wandb
 
 from routerl         import TrafficEnvironment
 from tqdm            import tqdm
@@ -339,6 +340,11 @@ if __name__ == "__main__":
     with open(exp_config_path, 'w', encoding='utf-8') as f:
         json.dump(dump_config, f, indent=4)
 
+    wandb.init(
+        project="PPO_Enhancement",
+        name=exp_id,
+        config=dump_config
+    )
     
     # Initialize the environment
     env = TrafficEnvironment(
@@ -445,7 +451,18 @@ if __name__ == "__main__":
                 action = agent_lookup[agent_id].model.act(observation)
                 
             env.step(action)
+        
+        episode_losses = [agent.model.loss[-1] for agent in env.machine_agents if len(agent.model.loss) > 0]
+        episode_entropies = [agent.model.entropy_coef for agent in env.machine_agents]
+        
+        metrics = {"episode": episode + human_learning_episodes}
+        if episode_losses:
+            metrics["train/avg_loss"] = sum(episode_losses) / len(episode_losses)
+        if episode_entropies:
+            metrics["train/avg_entropy_coef"] = sum(episode_entropies) / len(episode_entropies)
             
+        wandb.log(metrics)
+        
         if episode % plot_every == 0:
             env.plot_results()
         pbar.update()
@@ -490,3 +507,4 @@ if __name__ == "__main__":
     env.stop_simulation()
     clear_SUMO_files(os.path.join(records_folder, "SUMO_output"), os.path.join(records_folder, "episodes"), remove_additional_files=True)
     run_metrics_analysis(exp_id, results_folder="../results")
+    wandb.finish()
