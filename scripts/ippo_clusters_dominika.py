@@ -493,13 +493,34 @@ if __name__ == "__main__":
     pbar.set_description("Testing")
     for episode in range(test_eps):
         env.reset()
+        
+        episode_rewards = []
+        episode_travel_times = []
+        
         for agent_id in env.agent_iter():
             observation, reward, termination, truncation, info = env.last()
+            
             if termination or truncation:
                 action = None
+                episode_rewards.append(reward)
+                if "travel_time" in info:
+                    episode_travel_times.append(info["travel_time"])
             else:
                 action = agent_lookup[agent_id].model.act(observation)
+                
             env.step(action)
+            
+        wandb.log(
+            {
+                "episode": human_learning_episodes + training_eps + episode,
+                "testing/reward_sum": float(np.sum(episode_rewards)),
+                "testing/reward_mean": float(np.mean(episode_rewards)),
+                "testing/travel_time_mean": float(np.mean(episode_travel_times)) if episode_travel_times else 0.0,
+                "testing/travel_time_sum": float(np.sum(episode_travel_times)) if episode_travel_times else 0.0,
+            },
+            step=human_learning_episodes + training_eps + episode,
+        )
+        
         pbar.update()
     
     # Finalize the experiment
