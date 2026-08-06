@@ -341,7 +341,10 @@ if __name__ == "__main__":
         json.dump(dump_config, f, indent=4)
 
     wandb.init(
-        project="PPO_Enhancement",
+        # Set the wandb entity where your project will be logged (generally your team name).
+        entity="aintern26coexistence",
+        # Set the wandb project where this run will be logged.
+        project="PPO Enhancement",
         name=exp_id,
         config=dump_config
     )
