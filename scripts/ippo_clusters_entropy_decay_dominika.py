@@ -1,3 +1,9 @@
+#CHANGES:
+# 1 - ENTROPY DECAY:
+#   Added entropy_decay and entropy_min parameters to the PPO class
+#   This change allows the IPPO agent to smoothly transition from 
+#   exploring the network to exploiting the optimal routes, similar to the epsilon decay mechanism in IQL
+
 import os
 import sys
 
@@ -37,7 +43,8 @@ class PPO(BaseLearningModel):
     def __init__(self, state_size, action_space_size,
                  device="cpu", batch_size=16, lr=0.003, num_epochs=4,
                  num_hidden=2, widths=[32, 64, 32], clip_eps=0.2,
-                 normalize_advantage=True, entropy_coef=0.3,
+                 normalize_advantage=True, entropy_coef=0.1,
+                 entropy_decay=0.995, entropy_min=0.001,
                  action_mask=None):
         super().__init__()
         self.device = device
@@ -47,6 +54,8 @@ class PPO(BaseLearningModel):
         self.clip_eps = clip_eps
         self.normalize_advantage = normalize_advantage
         self.entropy_coef = entropy_coef
+        self.entropy_decay = entropy_decay
+        self.entropy_min = entropy_min
 
         self.policy_net = Network(state_size, action_space_size, num_hidden, widths).to(self.device)
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
@@ -139,6 +148,11 @@ class PPO(BaseLearningModel):
 
         self.loss.append(sum(step_loss) / len(step_loss))
         self.memory.clear()
+        self.decay_entropy()
+        
+    def decay_entropy(self):
+        # Decay the entropy coefficient after each learning step, ensuring it doesn't go below the minimum threshold
+        self.entropy_coef = max(self.entropy_min, self.entropy_coef * self.entropy_decay)
     
     
 # Main script to run the IPPO experiment
@@ -348,7 +362,6 @@ if __name__ == "__main__":
         name=exp_id,
         config=dump_config
     )
-    
     # Initialize the environment
     env = TrafficEnvironment(
         seed = env_seed,
@@ -431,13 +444,16 @@ if __name__ == "__main__":
             obs_size, agent.action_space_size,
             device=device, batch_size=batch_size, lr=lr, num_epochs=num_epochs,
             num_hidden=num_hidden, widths=widths, clip_eps=clip_eps,
-            normalize_advantage=normalize_advantage, entropy_coef=entropy_coef,
+            normalize_advantage=normalize_advantage, 
+            entropy_coef=params.get("entropy_coef", 0.1),
+            entropy_decay=params.get("entropy_decay", 0.995),
+            entropy_min=params.get("entropy_min", 0.001),
             action_mask=mask
         )
     agent_lookup = {str(agent.id): agent for agent in env.machine_agents}
     
     
-    ### Learning phase ###
+### Learning phase ###
     pbar.set_description("AV learning")
     os.makedirs(plots_folder, exist_ok=True)
     for episode in range(training_eps):
@@ -485,12 +501,13 @@ if __name__ == "__main__":
     
     ### Testing phase ###
     for agent in env.machine_agents:
-            agent.model.policy_net.eval()
-            agent.model.deterministic = True
-            
+        agent.model.policy_net.eval()
+        agent.model.deterministic = True
+        
     pbar.set_description("Testing")
     for episode in range(test_eps):
         env.reset()
+        
         episode_rewards = []
         episode_travel_times = []
         
@@ -542,4 +559,5 @@ if __name__ == "__main__":
     env.stop_simulation()
     clear_SUMO_files(os.path.join(records_folder, "SUMO_output"), os.path.join(records_folder, "episodes"), remove_additional_files=True)
     run_metrics_analysis(exp_id, results_folder="../results")
+    
     wandb.finish()
