@@ -38,6 +38,7 @@ class PPO(BaseLearningModel):
                  device="cpu", batch_size=16, lr=0.003, num_epochs=4,
                  num_hidden=2, widths=[32, 64, 32], clip_eps=0.2,
                  normalize_advantage=True, entropy_coef=0.3,
+                 ema_alpha=0.05,
                  action_mask=None):
         super().__init__()
         self.device = device
@@ -47,6 +48,8 @@ class PPO(BaseLearningModel):
         self.clip_eps = clip_eps
         self.normalize_advantage = normalize_advantage
         self.entropy_coef = entropy_coef
+        self.ema_alpha = ema_alpha
+        self.reward_ema = None
         
         self.policy_net = Network(state_size, action_space_size, num_hidden, widths).to(self.device)
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
@@ -104,13 +107,6 @@ class PPO(BaseLearningModel):
     def learn(self):
         if len(self.memory) < self.batch_size: return
         step_loss = list()
-        
-        all_rewards = [exp[3] for exp in self.memory]
-        current_mean_reward = sum(all_rewards) / len(all_rewards)
-        if self.reward_ema is None:
-            self.reward_ema = current_mean_reward
-        else:
-            self.reward_ema = (1-self.ema_alpha) * self.reward_ema + self.ema_alpha * current_mean_reward
 
         for _ in range(self.num_epochs):
             batch = random.sample(self.memory, self.batch_size)
@@ -128,12 +124,9 @@ class PPO(BaseLearningModel):
             new_log_probs = dist.log_prob(actions_tensor)
 
             ratio = torch.exp(new_log_probs - old_log_probs_tensor)
-            advantage = rewards_tensor - self.reward_ema
-            if self.normalize_advantage:
-                advantage = advantage / (rewards_tensor.std() + 1e-8)
-                
-            #if self.normalize_advantage: advantage = (rewards_tensor - rewards_tensor.mean()) / (rewards_tensor.std() + 1e-8)
-            #else: advantage = rewards_tensor
+            #advantage = rewards_tensor
+            if self.normalize_advantage: advantage = (rewards_tensor - rewards_tensor.mean()) / (rewards_tensor.std() + 1e-8)
+            else: advantage = rewards_tensor
 
             surr1 = ratio * advantage
             surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * advantage
@@ -442,6 +435,7 @@ if __name__ == "__main__":
             device=device, batch_size=batch_size, lr=lr, num_epochs=num_epochs,
             num_hidden=num_hidden, widths=widths, clip_eps=clip_eps,
             normalize_advantage=normalize_advantage, entropy_coef=entropy_coef,
+            ema_alpha=params.get("ema_alpha", 0.05),
             action_mask=mask
         )
     agent_lookup = {str(agent.id): agent for agent in env.machine_agents}
