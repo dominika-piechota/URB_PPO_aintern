@@ -106,39 +106,51 @@ class PPO(BaseLearningModel):
 
     def learn(self):
         if len(self.memory) < self.batch_size: return
+        
+        all_rewards = [exp[3] for exp in self.memory]
+        current_mean_reward = sum(all_rewards) / len(all_rewards)
+        if self.reward_ema is None:
+            self.reward_ema = current_mean_reward
+        else:
+            self.reward_ema = (1 - self.ema_alpha) * self.reward_ema + self.ema_alpha * current_mean_reward
+        
         step_loss = list()
+        memory_list = list(self.memory)
 
         for _ in range(self.num_epochs):
-            batch = random.sample(self.memory, self.batch_size)
-            states, actions, old_log_probs, rewards = zip(*batch)
-            states_tensor = torch.FloatTensor(states).to(self.device)
-            actions_tensor = torch.LongTensor(actions).to(self.device)
-            old_log_probs_tensor = torch.FloatTensor(old_log_probs).to(self.device)
-            rewards_tensor = torch.FloatTensor(rewards).to(self.device)
-            # print(f"""
-            # States: {states_tensor}, Actions: {actions_tensor},
-            # Old Log Probs: {old_log_probs_tensor}, Rewards: {rewards_tensor}
-            #       """)
+            random.shuffle(memory_list)
+            for start_idx in range(0, len(memory_list), self.batch_size):
+                batch = memory_list[start_idx : start_idx + self.batch_size]
+                if len(batch) < self.batch_size:
+                    continue
 
-            dist = self._distribution(states_tensor)
-            new_log_probs = dist.log_prob(actions_tensor)
+                states, actions, old_log_probs, rewards = zip(*batch)
+                states_tensor = torch.FloatTensor(states).to(self.device)
+                actions_tensor = torch.LongTensor(actions).to(self.device)
+                old_log_probs_tensor = torch.FloatTensor(old_log_probs).to(self.device)
+                rewards_tensor = torch.FloatTensor(rewards).to(self.device)
 
-            ratio = torch.exp(new_log_probs - old_log_probs_tensor)
-            #advantage = rewards_tensor
-            if self.normalize_advantage: advantage = (rewards_tensor - rewards_tensor.mean()) / (rewards_tensor.std() + 1e-8)
-            else: advantage = rewards_tensor
+                dist = self._distribution(states_tensor)
+                new_log_probs = dist.log_prob(actions_tensor)
 
-            surr1 = ratio * advantage
-            surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * advantage
-            #loss = -torch.min(surr1, surr2).mean()
-            entropy = dist.entropy().mean()
-            loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * entropy
+                ratio = torch.exp(new_log_probs - old_log_probs_tensor)
+                
+                advantage = rewards_tensor - self.reward_ema
+                
+                if self.normalize_advantage: 
+                    advantage = advantage / (rewards_tensor.std() + 1e-8)
 
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=1.0)
-            self.optimizer.step()
-            step_loss.append(loss.item())
+                surr1 = ratio * advantage
+                surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * advantage
+                
+                entropy = dist.entropy().mean()
+                loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * entropy
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=1.0)
+                self.optimizer.step()
+                step_loss.append(loss.item())
 
         self.loss.append(sum(step_loss) / len(step_loss))
         self.memory.clear()
