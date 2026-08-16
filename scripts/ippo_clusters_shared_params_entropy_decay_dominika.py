@@ -569,6 +569,8 @@ if __name__ == "__main__":
 
     for episode in range(training_eps):
         env.reset()
+        episode_rewards = []
+        episode_travel_times = []
 
         for agent_id in env.agent_iter():
             observation, reward, termination, truncation, info = env.last()
@@ -577,6 +579,9 @@ if __name__ == "__main__":
             if termination or truncation:
                 shared_model.push(key, reward)
                 action = None
+                episode_rewards.append(reward)
+                if "travel_time" in info:
+                    episode_travel_times.append(info["travel_time"])
             else:
                 action = shared_model.act(
                     observation,
@@ -615,6 +620,9 @@ if __name__ == "__main__":
     pbar.set_description("Testing")
     for episode in range(test_eps):
         env.reset()
+        
+        episode_rewards = []
+        episode_travel_times = []
 
         for agent_id in env.agent_iter():
             observation, reward, termination, truncation, info = env.last()
@@ -622,6 +630,9 @@ if __name__ == "__main__":
 
             if termination or truncation:
                 action = None
+                episode_rewards.append(reward)
+                if "travel_time" in info:
+                    episode_travel_times.append(info["travel_time"])
             else:
                 action = shared_model.act(
                     observation,
