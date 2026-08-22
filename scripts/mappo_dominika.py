@@ -156,6 +156,7 @@ class MAPPO(BaseLearningModel):
         # loss tracking
         self.loss_actor = []
         self.loss_critic = []
+        self.loss = self.loss_actor
 
     def train(self):
         """Set all models to training mode"""
@@ -546,7 +547,9 @@ def main():
         for agent_id in env.agent_iter():
             observation, reward, termination, truncation, info = env.last()
             
-            if termination or truncation:
+            if agent_id not in agent_lookup:
+                action = None
+            elif termination or truncation:
                 agent_lookup[agent_id].model.push(reward)
                 if episode % update_every == 0:
                     agent_lookup[agent_id].model.learn()
@@ -593,7 +596,7 @@ def main():
         for agent_id in env.agent_iter():
             observation, reward, termination, truncation, info = env.last()
             
-            if termination or truncation:
+            if agent_id not in agent_lookup or termination or truncation:
                 action = None
                 episode_rewards.append(reward)
                 if "travel_time" in info:
