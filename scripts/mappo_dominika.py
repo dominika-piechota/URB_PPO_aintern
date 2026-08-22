@@ -17,6 +17,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import wandb
 
 from routerl         import TrafficEnvironment
 from tqdm            import tqdm
@@ -449,7 +450,15 @@ def main():
     with open(exp_config_path, 'w', encoding='utf-8') as f:
         json.dump(dump_config, f, indent=4)
 
-    
+    wandb.init(
+        # Set the wandb entity where your project will be logged (generally your team name).
+        entity="aintern26coexistence",
+        # Set the wandb project where this run will be logged.
+        project="PPO Enhancement",
+        name=exp_id,
+        config=dump_config
+    )
+        
     # Initialize the environment
     env = TrafficEnvironment(
         seed = env_seed,
@@ -530,21 +539,42 @@ def main():
     os.makedirs(plots_folder, exist_ok=True)
     for episode in range(training_eps):
         env.reset()
+        
+        episode_rewards = []
+        episode_travel_times = []
+        
         for agent_id in env.agent_iter():
             observation, reward, termination, truncation, info = env.last()
             
-            if agent_id not in agent_lookup:
-                action = None
-            elif termination or truncation:
+            if termination or truncation:
                 agent_lookup[agent_id].model.push(reward)
                 if episode % update_every == 0:
                     agent_lookup[agent_id].model.learn()
                 action = None
+                
+                episode_rewards.append(reward)
+                if "travel_time" in info:
+                    episode_travel_times.append(info["travel_time"])
             else:
                 action = agent_lookup[agent_id].model.act(observation)
                 
             env.step(action)
+        
+        episode_losses = [agent.model.loss[-1] for agent in env.machine_agents if len(agent.model.loss) > 0]
+        episode_entropies = [agent.model.entropy_coef for agent in env.machine_agents]
+        
+        metrics = {"episode": episode + human_learning_episodes}
+        if episode_losses:
+            metrics["train/avg_loss"] = sum(episode_losses) / len(episode_losses)
+        if episode_entropies:
+            metrics["train/avg_entropy_coef"] = sum(episode_entropies) / len(episode_entropies)
             
+        metrics["train/reward_sum"] = float(np.sum(episode_rewards))
+        metrics["train/reward_mean"] = float(np.mean(episode_rewards))
+        metrics["train/travel_time_mean"] = float(np.mean(episode_travel_times)) if episode_travel_times else 0.0
+            
+        wandb.log(metrics)
+        
         if episode % plot_every == 0:
             env.plot_results()
         pbar.update()
@@ -557,13 +587,33 @@ def main():
     pbar.set_description("Testing")
     for episode in range(test_eps):
         env.reset()
+        episode_rewards = []
+        episode_travel_times = []
+        
         for agent_id in env.agent_iter():
             observation, reward, termination, truncation, info = env.last()
-            if agent_id not in agent_lookup or termination or truncation:
+            
+            if termination or truncation:
                 action = None
+                episode_rewards.append(reward)
+                if "travel_time" in info:
+                    episode_travel_times.append(info["travel_time"])
             else:
                 action = agent_lookup[agent_id].model.act(observation)
+                
             env.step(action)
+            
+        wandb.log(
+            {
+                "episode": human_learning_episodes + training_eps + episode,
+                "testing/reward_sum": float(np.sum(episode_rewards)),
+                "testing/reward_mean": float(np.mean(episode_rewards)),
+                "testing/travel_time_mean": float(np.mean(episode_travel_times)) if episode_travel_times else 0.0,
+                "testing/travel_time_sum": float(np.sum(episode_travel_times)) if episode_travel_times else 0.0,
+            },
+            step=human_learning_episodes + training_eps + episode,
+        )
+        
         pbar.update()
     
     # Finalize the experiment
@@ -588,7 +638,7 @@ def main():
     env.stop_simulation()
     clear_SUMO_files(os.path.join(records_folder, "SUMO_output"), os.path.join(records_folder, "episodes"), remove_additional_files=True)
     run_metrics_analysis(exp_id, results_folder="../results")
-
+    wandb.finish()
 
 if __name__ == "__main__":
     main()
