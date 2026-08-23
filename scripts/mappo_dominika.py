@@ -30,6 +30,8 @@ from utils           import print_agent_counts
 from utils           import run_metrics_analysis
 from utils           import save_loss_records
 from utils           import script_path_for_config
+
+
 class MAPPO(BaseLearningModel):
     def __init__(
         self,
@@ -45,7 +47,7 @@ class MAPPO(BaseLearningModel):
         critic_nets: list[nn.Module] | None = None,
         critic_arch_kwargs: dict | None = None,
         # --- default architecture parameters ---
-        default_widths: list[int] | None = None,
+        default_widths: list[int] = [32, 64, 32],
         # --- hyperparameters ---
         gamma: float = 0.99,
         clip_ratio: float = 0.2,
@@ -54,42 +56,13 @@ class MAPPO(BaseLearningModel):
         entropy_coef: float = 0.01,
         value_coef: float = 0.5,
         batch_size: int = 64,
-        num_epochs: int = 1,
         memory_size: int = 5000,
-        device: torch.device | str | None = None,
-        # Names used by the repository's algorithm JSON files.
-        config: dict | None = None,
-        widths: list[int] | None = None,
-        num_hidden: int | None = None,
-        lr: float | None = None,
-        clip_eps: float | None = None,
-        **_: object,
+        device: torch.device | None = None,
+        **kwargs
     ):
         super().__init__()
-        config = config or {}
-        default_widths = list(
-            config.get("widths", widths or default_widths or [32, 64, 32])
-        )
-        if num_hidden is None:
-            num_hidden = len(default_widths) - 1
-        if len(default_widths) != num_hidden + 1:
-            raise ValueError("widths must contain num_hidden + 1 entries")
-        if lr is not None:
-            lr_actor = lr_critic = lr
-        if clip_eps is not None:
-            clip_ratio = clip_eps
-        gamma = config.get("gamma", gamma)
-        clip_ratio = config.get("clip_ratio", config.get("clip_eps", clip_ratio))
-        lr_actor = config.get("lr_actor", config.get("lr", lr_actor))
-        lr_critic = config.get("lr_critic", config.get("lr", lr_critic))
-        entropy_coef = config.get("entropy_coef", entropy_coef)
-        value_coef = config.get("value_coef", value_coef)
-        batch_size = config.get("batch_size", batch_size)
-        num_epochs = config.get("num_epochs", num_epochs)
-        memory_size = config.get("memory_size", memory_size)
-
         # device setup 
-        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.state_size = state_size
         self.action_space_size = action_space_size
         self.num_agents = num_agents
@@ -103,7 +76,6 @@ class MAPPO(BaseLearningModel):
         self.entropy_coef = entropy_coef
         self.value_coef = value_coef
         self.batch_size = batch_size
-        self.num_epochs = num_epochs
         self.memory = deque(maxlen=memory_size)
         self.last_states = {}
         self.last_actions = {}
@@ -120,7 +92,7 @@ class MAPPO(BaseLearningModel):
         else:
             self.policies = []
             for _ in range(num_agents):
-                net = Network(state_size, action_space_size, num_hidden, ws).to(self.device)
+                net = Network(state_size, action_space_size, ws).to(self.device)
                 self.policies.append(net)
             if shared_policy:
                 self.policies = [self.policies[0]] * num_agents
@@ -141,7 +113,7 @@ class MAPPO(BaseLearningModel):
             ch_ws = critic_arch_kwargs.get('widths', default_widths) if critic_arch_kwargs else default_widths
             self.critics = []
             for _ in range(num_agents):
-                net = Network(state_size, 1, len(ch_ws) - 1, ch_ws).to(self.device)
+                net = Network(state_size, 1, ch_ws).to(self.device)
                 self.critics.append(net)
             if share_critic:
                 shared_critic = self.critics[0]
@@ -156,7 +128,6 @@ class MAPPO(BaseLearningModel):
         # loss tracking
         self.loss_actor = []
         self.loss_critic = []
-        self.loss = self.loss_actor
 
     def train(self):
         """Set all models to training mode"""
@@ -177,7 +148,6 @@ class MAPPO(BaseLearningModel):
         return self
 
     def push(self, agent_id: int | float, reward: float | None = None, next_state=None, done: bool = True):
-        """Store the last action for an agent using the repo AEC model contract."""
         if reward is None:
             reward = float(agent_id)
             agent_id = 0
@@ -197,7 +167,7 @@ class MAPPO(BaseLearningModel):
             )
         )
 
-    def act(self, state: any, agent_id: int = 0):
+    def act(self, state: any, agent_id: int):
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         with torch.no_grad():
             logits = self.policies[agent_id](state_tensor)
@@ -218,45 +188,21 @@ class MAPPO(BaseLearningModel):
         old_log_probs: list | None = None,
         next_states: list | None = None,
         dones: list | None = None,
-        agent_ids: list | None = None,
+        agent_ids: list | None = None
     ):
         if states is not None:
-            self._learn_once(
-                states, actions, rewards, old_log_probs,
-                next_states, dones, agent_ids,
-            )
-            remaining_epochs = self.num_epochs - 1
-        else:
-            remaining_epochs = self.num_epochs
-
-        for _ in range(max(0, remaining_epochs)):
-            self._learn_once()
-
-    def _learn_once(
-        self,
-        states: list | None = None,
-        actions: list | None = None,
-        rewards: list | None = None,
-        old_log_probs: list | None = None,
-        next_states: list | None = None,
-        dones: list | None = None,
-        agent_ids: list | None = None,
-    ):
-        if states is not None:
-            for transition in zip(
-                states, actions, rewards, old_log_probs, next_states, dones, agent_ids
-            ):
-                self.memory.append(transition)
+            for s, a, r, lp, ns, d, aid in zip(states, actions, rewards, old_log_probs, next_states, dones, agent_ids):
+                self.memory.append((s, a, r, lp, ns, d, aid))
 
         if len(self.memory) < self.batch_size: return
         
         batch = random.sample(self.memory, self.batch_size)
         s_batch, a_batch, r_batch, lp_batch, ns_batch, d_batch, id_batch = zip(*batch)
 
-        states_tensor = torch.FloatTensor(s_batch).to(self.device)
+        states_tensor = torch.FloatTensor(np.array(s_batch)).to(self.device)
         actions_tensor = torch.LongTensor(a_batch).unsqueeze(1).to(self.device)
         rewards_tensor = torch.FloatTensor(r_batch).unsqueeze(1).to(self.device)
-        next_states_tensor = torch.FloatTensor(ns_batch).to(self.device)
+        next_states_tensor = torch.FloatTensor(np.array(ns_batch)).to(self.device)
         old_log_probs_tensor = torch.FloatTensor(lp_batch).unsqueeze(1).to(self.device)
         dones_tensor = torch.FloatTensor(d_batch).unsqueeze(1).to(self.device)
 
@@ -298,6 +244,8 @@ class MAPPO(BaseLearningModel):
             total_policy_loss += policy_loss * batch_size_a
             total_entropy += entropy * batch_size_a
             total_count += batch_size_a
+
+        if total_count == 0: return
 
         # average losses
         avg_critic_loss = total_critic_loss / total_count
@@ -354,6 +302,7 @@ def main():
     parser.add_argument('--env-seed', type=int, default=42)
     parser.add_argument('--torch-seed', type=int, default=42)
     args = parser.parse_args()
+    
     ALGORITHM = "mappo_dominika"
     exp_id = args.id
     alg_config = args.alg_conf
@@ -362,14 +311,12 @@ def main():
     network = args.net
     env_seed = args.env_seed
     torch_seed = args.torch_seed
+
     print("### STARTING EXPERIMENT ###")
     print(f"Algorithm: {ALGORITHM.upper()}")
     print(f"Experiment ID: {exp_id}")
     print(f"Network: {network}")
     print(f"Environment seed: {env_seed}")
-    print(f"Algorithm config: {alg_config}")
-    print(f"Environment config: {env_config}")
-    print(f"Task config: {task_config}")
 
     os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
     logging.getLogger("matplotlib").setLevel(logging.ERROR)
@@ -381,14 +328,9 @@ def main():
     random.seed(env_seed)
     np.random.seed(env_seed)
 
-    device = (
-        torch.device(0)
-        if torch.cuda.is_available()
-        else torch.device("cpu")
-    )
+    device = torch.device(0) if torch.cuda.is_available() else torch.device("cpu")
     print("Device is: ", device)
         
-    # Parameter setting
     params = dict()
     alg_params = json.load(open(f"../config/algo_config/{ALGORITHM}/{alg_config}.json"))
     env_params = json.load(open(f"../config/env_config/{env_config}.json"))
@@ -398,34 +340,23 @@ def main():
     params.update(task_params)
     del params["desc"], env_params, task_params
     
-    
-    observation_type = params.get(
-        "observation_type",
-        params.get("observations", "previous_agents_plus_start_time"),
-    )
+    observation_type = params.get("observation_type", params.get("observations", "previous_agents_plus_start_time"))
     path_gen_workers_value = params.get("path_gen_workers", 4)
 
-    # set params as variables in this script
-    for key, value in params.items():
-        globals()[key] = value
+    for key, value in params.items(): globals()[key] = value
 
-    
     custom_network_folder = f"../networks/{network}"
     phases = [1, human_learning_episodes, int(training_eps) + human_learning_episodes]
     phase_names = ["Human stabilization", "Mutation and AV learning", "Testing phase"]
     records_folder = f"../results/{exp_id}"
     plots_folder = f"../results/{exp_id}/plots"
 
-    # Read origin-destinations
     od_file_path = os.path.join(custom_network_folder, f"od_{network}.txt")
     with open(od_file_path, 'r', encoding='utf-8') as f:
-        content = f.read()
-    data = ast.literal_eval(content)
+        data = ast.literal_eval(f.read())
     origins = data['origins']
     destinations = data['destinations']
 
-    
-    # Copy agents.csv from custom_network_folder to records_folder
     agents_csv_path = os.path.join(custom_network_folder, "agents.csv")
     num_agents = len(pd.read_csv(agents_csv_path))
     if os.path.exists(agents_csv_path):
@@ -437,7 +368,7 @@ def main():
             f.write(content)
         max_start_time = pd.read_csv(new_agents_csv_path)['start_time'].max()
     else:
-        raise FileNotFoundError(f"Agents CSV file not found at {agents_csv_path}. Please check the network folder.")
+        raise FileNotFoundError(f"Agents CSV file not found at {agents_csv_path}.")
             
     num_machines = int(num_agents * ratio_machines)
     total_episodes = human_learning_episodes + training_eps + test_eps
@@ -445,75 +376,50 @@ def main():
     # Dump exp config to records
     exp_config_path = os.path.join(records_folder, "exp_config.json")
     dump_config = params.copy()
-    dump_config["network"] = network
-    dump_config["env_seed"] = env_seed
-    dump_config["torch_seed"] = torch_seed
-    dump_config["env_config"] = env_config
-    dump_config["task_config"] = task_config
-    dump_config["alg_config"] = alg_config
-    dump_config["script"] = script_path_for_config(__file__)
-    dump_config["algorithm"] = ALGORITHM
-    dump_config["num_agents"] = num_agents
-    dump_config["num_machines"] = num_machines
-    dump_config["path_gen_workers"] = path_gen_workers_value
+    dump_config.update({
+        "network": network, "env_seed": env_seed, "torch_seed": torch_seed,
+        "env_config": env_config, "task_config": task_config, "alg_config": alg_config,
+        "algorithm": ALGORITHM, "num_agents": num_agents, "num_machines": num_machines,
+        "path_gen_workers": path_gen_workers_value
+    })
     with open(exp_config_path, 'w', encoding='utf-8') as f:
         json.dump(dump_config, f, indent=4)
 
     wandb.init(
-        # Set the wandb entity where your project will be logged (generally your team name).
         entity="aintern26coexistence",
-        # Set the wandb project where this run will be logged.
         project="PPO Enhancement",
         name=exp_id,
         config=dump_config
     )
         
-    # Initialize the environment
     env = TrafficEnvironment(
         seed = env_seed,
         create_agents = False,
         create_paths = True,
-        action_masks = action_masks,
         save_detectors_info = False,
         agent_parameters = {
             "new_machines_after_mutation": num_machines, 
             "human_parameters": {
-                "model": human_model,
-                "alpha": human_alpha,
-                "beta": human_beta,
-                "beta_randomness": human_beta_randomness,
-                "deterministic": human_deterministic,
+                "model": human_model, "alpha": human_alpha, "beta": human_beta,
+                "beta_randomness": human_beta_randomness, "deterministic": human_deterministic,
             },
             "machine_parameters" : {
-                "behavior" : av_behavior,
-                "observation_type" : observations
+                "behavior" : av_behavior, "observation_type" : observation_type
             }
         },
-        environment_parameters = {
-            "save_every" : save_every,
-        },
+        environment_parameters = {"save_every" : save_every},
         simulator_parameters = {
-            "network_name" : network,
-            "custom_network_folder" : custom_network_folder,
-            "sumo_type" : "sumo",
-            "simulation_timesteps" : max_start_time
+            "network_name" : network, "custom_network_folder" : custom_network_folder,
+            "sumo_type" : "sumo", "simulation_timesteps" : max_start_time
         }, 
         plotter_parameters = {
-            "phases" : phases,
-            "phase_names" : phase_names,
-            "smooth_by" : smooth_by,
-            "plot_choices" : plot_choices,
-            "records_folder" : records_folder,
-            "plots_folder" : plots_folder
+            "phases" : phases, "phase_names" : phase_names, "smooth_by" : smooth_by,
+            "plot_choices" : plot_choices, "records_folder" : records_folder, "plots_folder" : plots_folder
         },
         path_generation_parameters = {
-            "origins" : origins,
-            "destinations" : destinations,
-            "number_of_paths" : number_of_paths,
-            "beta" : path_gen_beta,
-            "num_samples" : num_samples,
-            "path_gen_workers" : params.get("path_gen_workers", 4),
-            "visualize_paths" : False
+            "origins" : origins, "destinations" : destinations, "number_of_paths" : params.get("number_of_paths", 4),
+            "beta" : path_gen_beta, "num_samples" : num_samples, 
+            "path_gen_workers" : path_gen_workers_value, "visualize_paths" : False
         } 
     )
 
@@ -521,13 +427,11 @@ def main():
     env.reset()
     print_agent_counts(env)
 
-
     ### Human learning phase ###
     pbar = tqdm(total=total_episodes, desc="Human learning")
     for episode in range(human_learning_episodes):
         env.step()
         pbar.update()
-
 
     # Mutation
     env.mutation(disable_human_learning = not should_humans_adapt, mutation_start_percentile = -1)
@@ -536,20 +440,24 @@ def main():
     
     # Set policies for machine agents
     for idx in range(len(env.machine_agents)):
-        env.machine_agents[idx].model = MAPPO(obs_size, env.machine_agents[idx].action_space_size,
-                            num_agents=1, shared_policy=True, share_critic=True,
-                            device=device, batch_size=batch_size, lr=lr, num_epochs=num_epochs,
-                            num_hidden=num_hidden, widths=widths, clip_eps=clip_eps,
-                            normalize_advantage=normalize_advantage, entropy_coef=entropy_coef)
+        agent = env.machine_agents[idx]
+        agent.model = MAPPO(
+            state_size=obs_size, 
+            action_space_size=agent.action_space_size,
+            num_agents=1, 
+            shared_policy=True, 
+            share_critic=True,
+            device=device,
+            **params
+        )
+        
     agent_lookup = {str(agent.id): agent for agent in env.machine_agents}
-    
     
     ### Learning phase ###
     pbar.set_description("AV learning")
     os.makedirs(plots_folder, exist_ok=True)
     for episode in range(training_eps):
         env.reset()
-        
         episode_rewards = []
         episode_travel_times = []
         
@@ -559,7 +467,7 @@ def main():
             if agent_id not in agent_lookup:
                 action = None
             elif termination or truncation:
-                agent_lookup[agent_id].model.push(reward)
+                agent_lookup[agent_id].model.push(agent_id=0, reward=reward) # Poprawione argumenty push
                 if episode % update_every == 0:
                     agent_lookup[agent_id].model.learn()
                 action = None
@@ -568,21 +476,18 @@ def main():
                 if "travel_time" in info:
                     episode_travel_times.append(info["travel_time"])
             else:
-                action = agent_lookup[agent_id].model.act(observation)
+                action = agent_lookup[agent_id].model.act(observation, agent_id=0)
                 
             env.step(action)
         
-        episode_losses = [agent.model.loss[-1] for agent in env.machine_agents if len(agent.model.loss) > 0]
-        episode_entropies = [agent.model.entropy_coef for agent in env.machine_agents]
+        episode_losses = [agent.model.loss_actor[-1] for agent in env.machine_agents if len(agent.model.loss_actor) > 0]
         
         metrics = {"episode": episode + human_learning_episodes}
         if episode_losses:
             metrics["train/avg_loss"] = sum(episode_losses) / len(episode_losses)
-        if episode_entropies:
-            metrics["train/avg_entropy_coef"] = sum(episode_entropies) / len(episode_entropies)
             
-        metrics["train/reward_sum"] = float(np.sum(episode_rewards))
-        metrics["train/reward_mean"] = float(np.mean(episode_rewards))
+        metrics["train/reward_sum"] = float(np.sum(episode_rewards)) if episode_rewards else 0.0
+        metrics["train/reward_mean"] = float(np.mean(episode_rewards)) if episode_rewards else 0.0
         metrics["train/travel_time_mean"] = float(np.mean(episode_travel_times)) if episode_travel_times else 0.0
             
         wandb.log(metrics)
@@ -590,7 +495,6 @@ def main():
         if episode % plot_every == 0:
             env.plot_results()
         pbar.update()
-    
     
     ### Testing phase ###
     for agent in env.machine_agents:
@@ -607,46 +511,48 @@ def main():
             
             if agent_id not in agent_lookup or termination or truncation:
                 action = None
-                episode_rewards.append(reward)
-                if "travel_time" in info:
-                    episode_travel_times.append(info["travel_time"])
+                if agent_id in agent_lookup:
+                    episode_rewards.append(reward)
+                    if "travel_time" in info:
+                        episode_travel_times.append(info["travel_time"])
             else:
-                action = agent_lookup[agent_id].model.act(observation)
+                action = agent_lookup[agent_id].model.act(observation, agent_id=0)
                 
             env.step(action)
             
         wandb.log(
             {
                 "episode": human_learning_episodes + training_eps + episode,
-                "testing/reward_sum": float(np.sum(episode_rewards)),
-                "testing/reward_mean": float(np.mean(episode_rewards)),
+                "testing/reward_sum": float(np.sum(episode_rewards)) if episode_rewards else 0.0,
+                "testing/reward_mean": float(np.mean(episode_rewards)) if episode_rewards else 0.0,
                 "testing/travel_time_mean": float(np.mean(episode_travel_times)) if episode_travel_times else 0.0,
                 "testing/travel_time_sum": float(np.sum(episode_travel_times)) if episode_travel_times else 0.0,
             },
             step=human_learning_episodes + training_eps + episode,
         )
-        
         pbar.update()
     
     # Finalize the experiment
     pbar.close()
     env.plot_results()
+    
+    plot_files = ["rewards.png", "travel_times.png"] 
+    images_to_log = {}
+    for plot_file in plot_files:
+        plot_path = os.path.join(plots_folder, plot_file)
+        if os.path.exists(plot_path):
+            plot_name = f"plots/{plot_file.replace('.png', '')}"
+            images_to_log[plot_name] = wandb.Image(plot_path)
+            
+    if images_to_log:
+        wandb.log(images_to_log)
+
     loss_records = []
     for agent in env.machine_agents:
         for iteration, loss_value in enumerate(agent.model.loss_actor, start=1):
-            loss_records.append(
-                {
-                    "iteration": iteration,
-                    "agent_id": agent.id,
-                    "loss": loss_value,
-                }
-            )
-    save_loss_records(
-        records_folder,
-        loss_records,
-        columns=["iteration", "agent_id", "loss"],
-    )
-
+            loss_records.append({"iteration": iteration, "agent_id": agent.id, "loss": loss_value})
+            
+    save_loss_records(records_folder, loss_records, columns=["iteration", "agent_id", "loss"])
     env.stop_simulation()
     clear_SUMO_files(os.path.join(records_folder, "SUMO_output"), os.path.join(records_folder, "episodes"), remove_additional_files=True)
     run_metrics_analysis(exp_id, results_folder="../results")
