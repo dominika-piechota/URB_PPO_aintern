@@ -397,6 +397,13 @@ def main():
     params.update(env_params)
     params.update(task_params)
     del params["desc"], env_params, task_params
+    
+    
+    observation_type = params.get(
+        "observation_type",
+        params.get("observations", "previous_agents_plus_start_time"),
+    )
+    path_gen_workers_value = params.get("path_gen_workers", 4)
 
     # set params as variables in this script
     for key, value in params.items():
@@ -448,6 +455,7 @@ def main():
     dump_config["algorithm"] = ALGORITHM
     dump_config["num_agents"] = num_agents
     dump_config["num_machines"] = num_machines
+    dump_config["path_gen_workers"] = path_gen_workers_value
     with open(exp_config_path, 'w', encoding='utf-8') as f:
         json.dump(dump_config, f, indent=4)
 
@@ -464,7 +472,8 @@ def main():
     env = TrafficEnvironment(
         seed = env_seed,
         create_agents = False,
-        create_paths = True,
+        create_paths = create_paths_flag,
+        action_masks = action_masks,
         save_detectors_info = False,
         agent_parameters = {
             "new_machines_after_mutation": num_machines, 
