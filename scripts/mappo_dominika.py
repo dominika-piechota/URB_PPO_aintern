@@ -472,7 +472,7 @@ def main():
     env = TrafficEnvironment(
         seed = env_seed,
         create_agents = False,
-        create_paths = create_paths_flag,
+        create_paths = True,
         action_masks = action_masks,
         save_detectors_info = False,
         agent_parameters = {
