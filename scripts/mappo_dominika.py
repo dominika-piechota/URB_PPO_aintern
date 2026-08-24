@@ -441,15 +441,18 @@ def main():
     # Set policies for machine agents
     for idx in range(len(env.machine_agents)):
         agent = env.machine_agents[idx]
-        agent.model = MAPPO(
-            state_size=obs_size, 
-            action_space_size=agent.action_space_size,
-            num_agents=1, 
-            shared_policy=True, 
-            share_critic=True,
-            device=device,
-            **params
-        )
+        
+        model_params = params.copy()
+        model_params.update({
+            "state_size": obs_size,
+            "action_space_size": agent.action_space_size,
+            "num_agents": 1,
+            "shared_policy": True,
+            "share_critic": True,
+            "device": device
+        })
+        
+        agent.model = MAPPO(**model_params)
         
     agent_lookup = {str(agent.id): agent for agent in env.machine_agents}
     
