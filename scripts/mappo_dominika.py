@@ -30,6 +30,7 @@ from utils           import print_agent_counts
 from utils           import run_metrics_analysis
 from utils           import save_loss_records
 from utils           import script_path_for_config
+from clustered_routes import ClusteredRoutesLoader, resolve_route_set
 
 
 class MAPPO(BaseLearningModel):
@@ -58,6 +59,7 @@ class MAPPO(BaseLearningModel):
         batch_size: int = 64,
         memory_size: int = 5000,
         device: torch.device | None = None,
+        action_mask: list | None = None,
         **kwargs
     ):
         super().__init__()
@@ -66,6 +68,10 @@ class MAPPO(BaseLearningModel):
         self.state_size = state_size
         self.action_space_size = action_space_size
         self.num_agents = num_agents
+        self.action_mask = (
+            torch.as_tensor(action_mask, dtype=torch.bool, device=self.device)
+            if action_mask is not None else None
+        )
 
         # training phase flag
         self.training = True
@@ -171,6 +177,8 @@ class MAPPO(BaseLearningModel):
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         with torch.no_grad():
             logits = self.policies[agent_id](state_tensor)
+            if self.action_mask is not None:
+                logits = logits.masked_fill(~self.action_mask, float("-inf"))
             dist = torch.distributions.Categorical(logits=logits)
             action = dist.sample().item() if self.training else torch.argmax(logits).item()
         log_prob = dist.log_prob(torch.tensor(action, device=self.device)).item()
@@ -232,6 +240,8 @@ class MAPPO(BaseLearningModel):
 
             # policy forward
             logits = self.policies[aid](states_tensor_a)
+            if self.action_mask is not None:
+                logits = logits.masked_fill(~self.action_mask.unsqueeze(0), float("-inf"))
             dist = torch.distributions.Categorical(logits=logits)
             new_log_probs = dist.log_prob(actions_tensor_a.squeeze(1)).unsqueeze(1)
             ratios = torch.exp(new_log_probs - old_log_probs_tensor_a)
@@ -301,6 +311,8 @@ def main():
     parser.add_argument('--net', type=str, required=True)
     parser.add_argument('--env-seed', type=int, default=42)
     parser.add_argument('--torch-seed', type=int, default=42)
+    parser.add_argument('--route-set', type=str, default="default_pre_integration")
+    parser.add_argument("--shuffle", action="store_true", default=False)
     args = parser.parse_args()
     
     ALGORITHM = "mappo_dominika"
@@ -372,7 +384,26 @@ def main():
             
     num_machines = int(num_agents * ratio_machines)
     total_episodes = human_learning_episodes + training_eps + test_eps
-            
+    
+    use_clustered_routes = params.get("use_clustered_routes", False)
+    route_set = resolve_route_set(network, args.route_set) if use_clustered_routes else None
+    
+    configured_number_of_paths = params.get("number_of_paths", 4)
+    create_paths_flag = True
+    action_masks = None
+    
+    if use_clustered_routes:
+        try:
+            route_set_dir = os.path.join(custom_network_folder, "clustered_routes", route_set)
+            clustered_loader = ClusteredRoutesLoader(network, custom_network_folder, args.shuffle, env_seed, route_set_dir=route_set_dir)
+            configured_number_of_paths = clustered_loader.get_number_of_paths()
+            clustered_loader.export_paths_routes(records_folder, origins, destinations)
+            action_masks = clustered_loader.create_masks(origins, destinations)
+            create_paths_flag = False
+        except FileNotFoundError as e:
+            print(f"[CLUSTERED ROUTES] Warning: {e}")
+            use_clustered_routes = False
+    
     # Dump exp config to records
     exp_config_path = os.path.join(records_folder, "exp_config.json")
     dump_config = params.copy()
@@ -395,7 +426,8 @@ def main():
     env = TrafficEnvironment(
         seed = env_seed,
         create_agents = False,
-        create_paths = True,
+        create_paths = create_paths_flag,
+        action_masks = action_masks,
         save_detectors_info = False,
         agent_parameters = {
             "new_machines_after_mutation": num_machines, 
@@ -417,10 +449,10 @@ def main():
             "plot_choices" : plot_choices, "records_folder" : records_folder, "plots_folder" : plots_folder
         },
         path_generation_parameters = {
-            "origins" : origins, "destinations" : destinations, "number_of_paths" : params.get("number_of_paths", 4),
+            "origins" : origins, "destinations" : destinations, "number_of_paths" : configured_number_of_paths,
             "beta" : path_gen_beta, "num_samples" : num_samples, 
             "path_gen_workers" : path_gen_workers_value, "visualize_paths" : False
-        } 
+        }
     )
 
     env.start()
@@ -442,6 +474,11 @@ def main():
     for idx in range(len(env.machine_agents)):
         agent = env.machine_agents[idx]
         
+        mask = None
+        if action_masks is not None:
+            key = (agent.origin, agent.destination)
+            mask = action_masks.get(key, None)
+        
         model_params = params.copy()
         model_params.update({
             "state_size": obs_size,
@@ -449,7 +486,8 @@ def main():
             "num_agents": 1,
             "shared_policy": True,
             "share_critic": True,
-            "device": device
+            "device": device,
+            "action_mask": mask
         })
         
         agent.model = MAPPO(**model_params)
