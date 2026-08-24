@@ -92,7 +92,7 @@ class MAPPO(BaseLearningModel):
         else:
             self.policies = []
             for _ in range(num_agents):
-                net = Network(state_size, action_space_size, ws).to(self.device)
+                net = Network(state_size, action_space_size, len(ws) - 1, ws).to(self.device)
                 self.policies.append(net)
             if shared_policy:
                 self.policies = [self.policies[0]] * num_agents
@@ -113,7 +113,7 @@ class MAPPO(BaseLearningModel):
             ch_ws = critic_arch_kwargs.get('widths', default_widths) if critic_arch_kwargs else default_widths
             self.critics = []
             for _ in range(num_agents):
-                net = Network(state_size, 1, ch_ws).to(self.device)
+                net = Network(state_size, 1, len(ch_ws) - 1, ch_ws).to(self.device)
                 self.critics.append(net)
             if share_critic:
                 shared_critic = self.critics[0]
