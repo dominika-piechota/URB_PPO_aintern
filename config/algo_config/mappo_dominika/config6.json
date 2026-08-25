@@ -1,5 +1,5 @@
 {
-    "training_eps": 20000,
+    "training_eps": 4000,
     "batch_size": 16,
     "update_every": 1,
     "lr": 0.0003,

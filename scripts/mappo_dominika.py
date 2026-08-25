@@ -30,7 +30,6 @@ from utils           import print_agent_counts
 from utils           import run_metrics_analysis
 from utils           import save_loss_records
 from utils           import script_path_for_config
-from clustered_routes import ClusteredRoutesLoader, resolve_route_set
 
 
 class MAPPO(BaseLearningModel):
@@ -59,7 +58,6 @@ class MAPPO(BaseLearningModel):
         batch_size: int = 64,
         memory_size: int = 5000,
         device: torch.device | None = None,
-        action_mask: list | None = None,
         **kwargs
     ):
         super().__init__()
@@ -68,26 +66,24 @@ class MAPPO(BaseLearningModel):
         self.state_size = state_size
         self.action_space_size = action_space_size
         self.num_agents = num_agents
-        self.action_masks = action_mask or {}
 
         # training phase flag
         self.training = True
         
         # hyperparameters
-        ws = kwargs.get("widths", default_widths)
-        self.clip_ratio = kwargs.get("clip_eps", clip_ratio)
-        lr_actor = kwargs.get("lr", lr_actor)
-        lr_critic = kwargs.get("lr", lr_critic)
-
         self.gamma = gamma
-        self.entropy_coef = kwargs.get("entropy_coef", entropy_coef)
-        self.value_coef = kwargs.get("value_coef", value_coef)
-        self.batch_size = kwargs.get("batch_size", batch_size)
-        self.memory = deque(maxlen=kwargs.get("memory_size", memory_size))
+        self.clip_ratio = clip_ratio
+        self.entropy_coef = entropy_coef
+        self.value_coef = value_coef
+        self.batch_size = batch_size
+        self.memory = deque(maxlen=memory_size)
         self.last_states = {}
         self.last_actions = {}
         self.last_log_probs = {}
-        
+
+        # architecture args
+        ws = default_widths if policy_arch_kwargs is None else policy_arch_kwargs.get('widths', default_widths)
+
         # --- Policy networks ---
         if policy_nets is not None:
             assert len(policy_nets) == num_agents or shared_policy, \
@@ -96,7 +92,7 @@ class MAPPO(BaseLearningModel):
         else:
             self.policies = []
             for _ in range(num_agents):
-                net = Network(state_size, action_space_size, len(ws) - 1, ws).to(self.device)
+                net = Network(state_size, action_space_size, ws).to(self.device)
                 self.policies.append(net)
             if shared_policy:
                 self.policies = [self.policies[0]] * num_agents
@@ -117,7 +113,7 @@ class MAPPO(BaseLearningModel):
             ch_ws = critic_arch_kwargs.get('widths', default_widths) if critic_arch_kwargs else default_widths
             self.critics = []
             for _ in range(num_agents):
-                net = Network(state_size, 1, len(ch_ws) - 1, ch_ws).to(self.device)
+                net = Network(state_size, 1, ch_ws).to(self.device)
                 self.critics.append(net)
             if share_critic:
                 shared_critic = self.critics[0]
@@ -175,7 +171,6 @@ class MAPPO(BaseLearningModel):
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         with torch.no_grad():
             logits = self.policies[agent_id](state_tensor)
-            mask = self.action_masks.get(agent_id, None) 
             dist = torch.distributions.Categorical(logits=logits)
             action = dist.sample().item() if self.training else torch.argmax(logits).item()
         log_prob = dist.log_prob(torch.tensor(action, device=self.device)).item()
@@ -237,9 +232,6 @@ class MAPPO(BaseLearningModel):
 
             # policy forward
             logits = self.policies[aid](states_tensor_a)
-            mask_action = self.action_masks.get(aid, None)
-            if mask_action is not None:
-                logits = logits.masked_fill(~mask_action.unsqueeze(0), float("-inf"))
             dist = torch.distributions.Categorical(logits=logits)
             new_log_probs = dist.log_prob(actions_tensor_a.squeeze(1)).unsqueeze(1)
             ratios = torch.exp(new_log_probs - old_log_probs_tensor_a)
@@ -303,14 +295,12 @@ class MAPPO(BaseLearningModel):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--id', type=str, required=True)
-    parser.add_argument('--env-conf', type=str, default="clusters_eta")
+    parser.add_argument('--env-conf', type=str, default="config1")
     parser.add_argument('--task-conf', type=str, required=True)
     parser.add_argument('--alg-conf', type=str, required=True)
     parser.add_argument('--net', type=str, required=True)
     parser.add_argument('--env-seed', type=int, default=42)
     parser.add_argument('--torch-seed', type=int, default=42)
-    parser.add_argument('--route-set', type=str, default="default_pre_integration")
-    parser.add_argument("--shuffle", action="store_true", default=False)
     args = parser.parse_args()
     
     ALGORITHM = "mappo_dominika"
@@ -382,26 +372,7 @@ def main():
             
     num_machines = int(num_agents * ratio_machines)
     total_episodes = human_learning_episodes + training_eps + test_eps
-    
-    use_clustered_routes = params.get("use_clustered_routes", False)
-    route_set = resolve_route_set(network, args.route_set) if use_clustered_routes else None
-    
-    configured_number_of_paths = params.get("number_of_paths", 4)
-    create_paths_flag = True
-    action_masks = None
-    
-    if use_clustered_routes:
-        try:
-            route_set_dir = os.path.join(custom_network_folder, "clustered_routes", route_set)
-            clustered_loader = ClusteredRoutesLoader(network, custom_network_folder, args.shuffle, env_seed, route_set_dir=route_set_dir)
-            configured_number_of_paths = clustered_loader.get_number_of_paths()
-            clustered_loader.export_paths_routes(records_folder, origins, destinations)
-            action_masks = clustered_loader.create_masks(origins, destinations)
-            create_paths_flag = False
-        except FileNotFoundError as e:
-            print(f"[CLUSTERED ROUTES] Warning: {e}")
-            use_clustered_routes = False
-    
+            
     # Dump exp config to records
     exp_config_path = os.path.join(records_folder, "exp_config.json")
     dump_config = params.copy()
@@ -424,8 +395,7 @@ def main():
     env = TrafficEnvironment(
         seed = env_seed,
         create_agents = False,
-        create_paths = create_paths_flag,
-        action_masks = action_masks,
+        create_paths = True,
         save_detectors_info = False,
         agent_parameters = {
             "new_machines_after_mutation": num_machines, 
@@ -447,10 +417,10 @@ def main():
             "plot_choices" : plot_choices, "records_folder" : records_folder, "plots_folder" : plots_folder
         },
         path_generation_parameters = {
-            "origins" : origins, "destinations" : destinations, "number_of_paths" : configured_number_of_paths,
+            "origins" : origins, "destinations" : destinations, "number_of_paths" : params.get("number_of_paths", 4),
             "beta" : path_gen_beta, "num_samples" : num_samples, 
             "path_gen_workers" : path_gen_workers_value, "visualize_paths" : False
-        }
+        } 
     )
 
     env.start()
@@ -469,36 +439,20 @@ def main():
     obs_size = env.observation_space(env.possible_agents[0]).shape[0]
     
     # Set policies for machine agents
-    shared_action_space_size = max(agent.action_space_size for agent in env.machine_agents)
-    agent_to_idx = {str(agent.id): idx for idx, agent in enumerate(env.machine_agents)}
-    
-    internal_action_masks = {}
-    for idx, agent in enumerate(env.machine_agents):
-        mask_array = np.zeros(shared_action_space_size, dtype=np.bool_)
-        if action_masks is not None:
-            key = (agent.origin, agent.destination)
-            valid_mask = action_masks.get(key, None)
-            if valid_mask is not None:
-                mask_array[:len(valid_mask)] = valid_mask
-        else:
-            mask_array[:agent.action_space_size] = True
-        internal_action_masks[idx] = torch.as_tensor(mask_array, dtype=torch.bool, device=device)
-
-    model_params = params.copy()
-    model_params.update({
-        "state_size": obs_size,
-        "action_space_size": shared_action_space_size,
-        "num_agents": len(env.machine_agents),
-        "shared_policy": True,
-        "share_critic": True,
-        "device": device,
-        "action_mask": internal_action_masks
-    })
-    
-    shared_mappo = MAPPO(**model_params)
-    
-    for agent in env.machine_agents:
-        agent.model = shared_mappo
+    for idx in range(len(env.machine_agents)):
+        agent = env.machine_agents[idx]
+        
+        model_params = params.copy()
+        model_params.update({
+            "state_size": obs_size,
+            "action_space_size": agent.action_space_size,
+            "num_agents": 1,
+            "shared_policy": True,
+            "share_critic": True,
+            "device": device
+        })
+        
+        agent.model = MAPPO(**model_params)
         
     agent_lookup = {str(agent.id): agent for agent in env.machine_agents}
     
@@ -516,23 +470,20 @@ def main():
             if agent_id not in agent_lookup:
                 action = None
             elif termination or truncation:
-                internal_id = agent_to_idx[str(agent_id)]
-                shared_mappo.push(agent_id=internal_id, reward=reward)
+                agent_lookup[agent_id].model.push(agent_id=0, reward=reward) # Poprawione argumenty push
+                if episode % update_every == 0:
+                    agent_lookup[agent_id].model.learn()
                 action = None
                 
                 episode_rewards.append(reward)
                 if "travel_time" in info:
                     episode_travel_times.append(info["travel_time"])
             else:
-                internal_id = agent_to_idx[str(agent_id)]
-                action = shared_mappo.act(observation, agent_id=internal_id)
+                action = agent_lookup[agent_id].model.act(observation, agent_id=0)
                 
             env.step(action)
-            
-        if episode % update_every == 0:
-            shared_mappo.learn()
         
-        episode_losses = [shared_mappo.loss_actor[-1]] if len(shared_mappo.loss_actor) > 0 else []
+        episode_losses = [agent.model.loss_actor[-1] for agent in env.machine_agents if len(agent.model.loss_actor) > 0]
         
         metrics = {"episode": episode + human_learning_episodes}
         if episode_losses:
@@ -568,8 +519,7 @@ def main():
                     if "travel_time" in info:
                         episode_travel_times.append(info["travel_time"])
             else:
-                internal_id = agent_to_idx[str(agent_id)]
-                action = shared_mappo.act(observation, agent_id=internal_id)
+                action = agent_lookup[agent_id].model.act(observation, agent_id=0)
                 
             env.step(action)
             
@@ -600,11 +550,11 @@ def main():
     if images_to_log:
         wandb.log(images_to_log)
 
-    loss_records = [
-        {"iteration": iteration, "agent_id": "shared", "loss": loss_value}
-        for iteration, loss_value in enumerate(shared_mappo.loss_actor, start=1)
-    ]
-    
+    loss_records = []
+    for agent in env.machine_agents:
+        for iteration, loss_value in enumerate(agent.model.loss_actor, start=1):
+            loss_records.append({"iteration": iteration, "agent_id": agent.id, "loss": loss_value})
+            
     save_loss_records(records_folder, loss_records, columns=["iteration", "agent_id", "loss"])
     env.stop_simulation()
     clear_SUMO_files(os.path.join(records_folder, "SUMO_output"), os.path.join(records_folder, "episodes"), remove_additional_files=True)
