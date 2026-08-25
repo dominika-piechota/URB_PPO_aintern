@@ -68,28 +68,26 @@ class MAPPO(BaseLearningModel):
         self.state_size = state_size
         self.action_space_size = action_space_size
         self.num_agents = num_agents
-        self.action_mask = (
-            torch.as_tensor(action_mask, dtype=torch.bool, device=self.device)
-            if action_mask is not None else None
-        )
+        self.action_masks = action_mask or {}
 
         # training phase flag
         self.training = True
         
         # hyperparameters
+        ws = kwargs.get("widths", default_widths)
+        self.clip_ratio = kwargs.get("clip_eps", clip_ratio)
+        lr_actor = kwargs.get("lr", lr_actor)
+        lr_critic = kwargs.get("lr", lr_critic)
+
         self.gamma = gamma
-        self.clip_ratio = clip_ratio
-        self.entropy_coef = entropy_coef
-        self.value_coef = value_coef
-        self.batch_size = batch_size
-        self.memory = deque(maxlen=memory_size)
+        self.entropy_coef = kwargs.get("entropy_coef", entropy_coef)
+        self.value_coef = kwargs.get("value_coef", value_coef)
+        self.batch_size = kwargs.get("batch_size", batch_size)
+        self.memory = deque(maxlen=kwargs.get("memory_size", memory_size))
         self.last_states = {}
         self.last_actions = {}
         self.last_log_probs = {}
-
-        # architecture args
-        ws = default_widths if policy_arch_kwargs is None else policy_arch_kwargs.get('widths', default_widths)
-
+        
         # --- Policy networks ---
         if policy_nets is not None:
             assert len(policy_nets) == num_agents or shared_policy, \
@@ -177,8 +175,7 @@ class MAPPO(BaseLearningModel):
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         with torch.no_grad():
             logits = self.policies[agent_id](state_tensor)
-            if self.action_mask is not None:
-                logits = logits.masked_fill(~self.action_mask, float("-inf"))
+            mask = self.action_masks.get(agent_id, None) 
             dist = torch.distributions.Categorical(logits=logits)
             action = dist.sample().item() if self.training else torch.argmax(logits).item()
         log_prob = dist.log_prob(torch.tensor(action, device=self.device)).item()
@@ -240,8 +237,9 @@ class MAPPO(BaseLearningModel):
 
             # policy forward
             logits = self.policies[aid](states_tensor_a)
-            if self.action_mask is not None:
-                logits = logits.masked_fill(~self.action_mask.unsqueeze(0), float("-inf"))
+            mask_action = self.action_masks.get(aid, None)
+            if mask_action is not None:
+                logits = logits.masked_fill(~mask_action.unsqueeze(0), float("-inf"))
             dist = torch.distributions.Categorical(logits=logits)
             new_log_probs = dist.log_prob(actions_tensor_a.squeeze(1)).unsqueeze(1)
             ratios = torch.exp(new_log_probs - old_log_probs_tensor_a)
@@ -305,7 +303,7 @@ class MAPPO(BaseLearningModel):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--id', type=str, required=True)
-    parser.add_argument('--env-conf', type=str, default="config1")
+    parser.add_argument('--env-conf', type=str, default="clusters_eta")
     parser.add_argument('--task-conf', type=str, required=True)
     parser.add_argument('--alg-conf', type=str, required=True)
     parser.add_argument('--net', type=str, required=True)
@@ -471,26 +469,36 @@ def main():
     obs_size = env.observation_space(env.possible_agents[0]).shape[0]
     
     # Set policies for machine agents
-    for idx in range(len(env.machine_agents)):
-        agent = env.machine_agents[idx]
-        
-        mask = None
+    shared_action_space_size = max(agent.action_space_size for agent in env.machine_agents)
+    agent_to_idx = {str(agent.id): idx for idx, agent in enumerate(env.machine_agents)}
+    
+    internal_action_masks = {}
+    for idx, agent in enumerate(env.machine_agents):
+        mask_array = np.zeros(shared_action_space_size, dtype=np.bool_)
         if action_masks is not None:
             key = (agent.origin, agent.destination)
-            mask = action_masks.get(key, None)
-        
-        model_params = params.copy()
-        model_params.update({
-            "state_size": obs_size,
-            "action_space_size": agent.action_space_size,
-            "num_agents": 1,
-            "shared_policy": True,
-            "share_critic": True,
-            "device": device,
-            "action_mask": mask
-        })
-        
-        agent.model = MAPPO(**model_params)
+            valid_mask = action_masks.get(key, None)
+            if valid_mask is not None:
+                mask_array[:len(valid_mask)] = valid_mask
+        else:
+            mask_array[:agent.action_space_size] = True
+        internal_action_masks[idx] = torch.as_tensor(mask_array, dtype=torch.bool, device=device)
+
+    model_params = params.copy()
+    model_params.update({
+        "state_size": obs_size,
+        "action_space_size": shared_action_space_size,
+        "num_agents": len(env.machine_agents),
+        "shared_policy": True,
+        "share_critic": True,
+        "device": device,
+        "action_mask": internal_action_masks
+    })
+    
+    shared_mappo = MAPPO(**model_params)
+    
+    for agent in env.machine_agents:
+        agent.model = shared_mappo
         
     agent_lookup = {str(agent.id): agent for agent in env.machine_agents}
     
@@ -508,20 +516,23 @@ def main():
             if agent_id not in agent_lookup:
                 action = None
             elif termination or truncation:
-                agent_lookup[agent_id].model.push(agent_id=0, reward=reward) # Poprawione argumenty push
-                if episode % update_every == 0:
-                    agent_lookup[agent_id].model.learn()
+                internal_id = agent_to_idx[str(agent_id)]
+                shared_mappo.push(agent_id=internal_id, reward=reward)
                 action = None
                 
                 episode_rewards.append(reward)
                 if "travel_time" in info:
                     episode_travel_times.append(info["travel_time"])
             else:
-                action = agent_lookup[agent_id].model.act(observation, agent_id=0)
+                internal_id = agent_to_idx[str(agent_id)]
+                action = shared_mappo.act(observation, agent_id=internal_id)
                 
             env.step(action)
+            
+        if episode % update_every == 0:
+            shared_mappo.learn()
         
-        episode_losses = [agent.model.loss_actor[-1] for agent in env.machine_agents if len(agent.model.loss_actor) > 0]
+        episode_losses = [shared_mappo.loss_actor[-1]] if len(shared_mappo.loss_actor) > 0 else []
         
         metrics = {"episode": episode + human_learning_episodes}
         if episode_losses:
@@ -557,7 +568,8 @@ def main():
                     if "travel_time" in info:
                         episode_travel_times.append(info["travel_time"])
             else:
-                action = agent_lookup[agent_id].model.act(observation, agent_id=0)
+                internal_id = agent_to_idx[str(agent_id)]
+                action = shared_mappo.act(observation, agent_id=internal_id)
                 
             env.step(action)
             
@@ -588,11 +600,11 @@ def main():
     if images_to_log:
         wandb.log(images_to_log)
 
-    loss_records = []
-    for agent in env.machine_agents:
-        for iteration, loss_value in enumerate(agent.model.loss_actor, start=1):
-            loss_records.append({"iteration": iteration, "agent_id": agent.id, "loss": loss_value})
-            
+    loss_records = [
+        {"iteration": iteration, "agent_id": "shared", "loss": loss_value}
+        for iteration, loss_value in enumerate(shared_mappo.loss_actor, start=1)
+    ]
+    
     save_loss_records(records_folder, loss_records, columns=["iteration", "agent_id", "loss"])
     env.stop_simulation()
     clear_SUMO_files(os.path.join(records_folder, "SUMO_output"), os.path.join(records_folder, "episodes"), remove_additional_files=True)
