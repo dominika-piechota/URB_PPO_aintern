@@ -67,6 +67,7 @@ class MAPPO(BaseLearningModel):
         self.state_size = state_size
         self.action_space_size = action_space_size
         self.num_agents = num_agents
+        self.num_epochs = kwargs.get("num_epochs", 4)
 
         # training phase flag
         self.training = True
@@ -197,88 +198,99 @@ class MAPPO(BaseLearningModel):
 
         if len(self.memory) < self.batch_size: return
         
-        batch = random.sample(self.memory, self.batch_size)
-        s_batch, a_batch, r_batch, lp_batch, ns_batch, d_batch, id_batch = zip(*batch)
+        step_loss_actor = []
+        step_loss_critic = []
 
-        states_tensor = torch.FloatTensor(np.array(s_batch)).to(self.device)
-        actions_tensor = torch.LongTensor(a_batch).unsqueeze(1).to(self.device)
-        rewards_tensor = torch.FloatTensor(r_batch).unsqueeze(1).to(self.device)
-        next_states_tensor = torch.FloatTensor(np.array(ns_batch)).to(self.device)
-        old_log_probs_tensor = torch.FloatTensor(lp_batch).unsqueeze(1).to(self.device)
-        dones_tensor = torch.FloatTensor(d_batch).unsqueeze(1).to(self.device)
+        for _ in range(self.num_epochs):
+            batch = random.sample(self.memory, self.batch_size)
+            s_batch, a_batch, r_batch, lp_batch, ns_batch, d_batch, id_batch = zip(*batch)
 
-        id_tensor = torch.LongTensor(id_batch)
-        unique_ids = id_tensor.unique()
+            states_tensor = torch.FloatTensor(np.array(s_batch)).to(self.device)
+            actions_tensor = torch.LongTensor(a_batch).unsqueeze(1).to(self.device)
+            rewards_tensor = torch.FloatTensor(r_batch).unsqueeze(1).to(self.device)
+            next_states_tensor = torch.FloatTensor(np.array(ns_batch)).to(self.device)
+            old_log_probs_tensor = torch.FloatTensor(lp_batch).unsqueeze(1).to(self.device)
+            dones_tensor = torch.FloatTensor(d_batch).unsqueeze(1).to(self.device)
 
-        total_policy_loss = 0.0
-        total_critic_loss = 0.0
-        total_entropy = 0.0
-        total_count = 0
+            id_tensor = torch.LongTensor(id_batch)
+            unique_ids = id_tensor.unique()
 
-        for aid in unique_ids.tolist():
-            mask = (id_tensor == aid)
-            states_tensor_a = states_tensor[mask]
-            actions_tensor_a = actions_tensor[mask]
-            rewards_tensor_a = rewards_tensor[mask]
-            next_states_tensor_a = next_states_tensor[mask]
-            old_log_probs_tensor_a = old_log_probs_tensor[mask]
-            dones_tensor_a = dones_tensor[mask]
+            total_policy_loss = 0.0
+            total_critic_loss = 0.0
+            total_entropy = 0.0
+            total_count = 0
 
-            # critic forward
-            values = self.critics[aid](states_tensor_a)
-            next_values = self.critics[aid](next_states_tensor_a)
-            with torch.no_grad():
-                targets = rewards_tensor_a + self.gamma * next_values * (1 - dones_tensor_a)
-            critic_loss = nn.MSELoss()(values, targets)
-
-            # policy forward
-            logits = self.policies[aid](states_tensor_a)
-            dist = torch.distributions.Categorical(logits=logits)
-            new_log_probs = dist.log_prob(actions_tensor_a.squeeze(1)).unsqueeze(1)
-            ratios = torch.exp(new_log_probs - old_log_probs_tensor_a)
-            clipped_ratios = torch.clamp(ratios, 1 - self.clip_ratio, 1 + self.clip_ratio)
-            policy_loss = -torch.min(ratios * (targets - values.detach()), clipped_ratios * (targets - values.detach())).mean()
-            entropy = dist.entropy().mean()
-
-            batch_size_a = mask.sum().item()
-            total_critic_loss += critic_loss * batch_size_a
-            total_policy_loss += policy_loss * batch_size_a
-            total_entropy += entropy * batch_size_a
-            total_count += batch_size_a
-
-        if total_count == 0: return
-
-        # average losses
-        avg_critic_loss = total_critic_loss / total_count
-        avg_policy_loss = total_policy_loss / total_count
-        avg_entropy = total_entropy / total_count
-
-        # update critic
-        if isinstance(self.critic_optim, list):
             for aid in unique_ids.tolist():
-                self.critic_optim[aid].zero_grad()
-            avg_critic_loss.backward()
-            for aid in unique_ids.tolist():
-                self.critic_optim[aid].step()
-        else:
-            self.critic_optim.zero_grad()
-            avg_critic_loss.backward()
-            self.critic_optim.step()
-        self.loss_critic.append(avg_critic_loss.item())
+                mask = (id_tensor == aid)
+                states_tensor_a = states_tensor[mask]
+                actions_tensor_a = actions_tensor[mask]
+                rewards_tensor_a = rewards_tensor[mask]
+                next_states_tensor_a = next_states_tensor[mask]
+                old_log_probs_tensor_a = old_log_probs_tensor[mask]
+                dones_tensor_a = dones_tensor[mask]
 
-        # update actor
-        total_loss = avg_policy_loss - self.entropy_coef * avg_entropy
-        if isinstance(self.actor_optimizer, list):
-            for aid in unique_ids.tolist():
-                self.actor_optimizer[aid].zero_grad()
-            total_loss.backward()
-            for aid in unique_ids.tolist():
-                self.actor_optimizer[aid].step()
-        else:
-            self.actor_optimizer.zero_grad()
-            total_loss.backward()
-            self.actor_optimizer.step()
-        self.loss_actor.append(avg_policy_loss.item())
+                values = self.critics[aid](states_tensor_a)
+                next_values = self.critics[aid](next_states_tensor_a)
+                with torch.no_grad():
+                    targets = rewards_tensor_a + self.gamma * next_values * (1 - dones_tensor_a)
+                critic_loss = nn.MSELoss()(values, targets)
+
+                logits = self.policies[aid](states_tensor_a)
+                mask_action = self.action_masks.get(aid, None)
+                if mask_action is not None:
+                    logits = logits.masked_fill(~mask_action.unsqueeze(0), float("-inf"))
+                dist = torch.distributions.Categorical(logits=logits)
+                new_log_probs = dist.log_prob(actions_tensor_a.squeeze(1)).unsqueeze(1)
+                ratios = torch.exp(new_log_probs - old_log_probs_tensor_a)
+                clipped_ratios = torch.clamp(ratios, 1 - self.clip_ratio, 1 + self.clip_ratio)
+                policy_loss = -torch.min(ratios * (targets - values.detach()), clipped_ratios * (targets - values.detach())).mean()
+                entropy = dist.entropy().mean()
+
+                batch_size_a = mask.sum().item()
+                total_critic_loss += critic_loss * batch_size_a
+                total_policy_loss += policy_loss * batch_size_a
+                total_entropy += entropy * batch_size_a
+                total_count += batch_size_a
+
+            if total_count == 0: continue
+
+            avg_critic_loss = total_critic_loss / total_count
+            avg_policy_loss = total_policy_loss / total_count
+            avg_entropy = total_entropy / total_count
+
+            if isinstance(self.critic_optim, list):
+                for aid in unique_ids.tolist():
+                    self.critic_optim[aid].zero_grad()
+                avg_critic_loss.backward()
+                for aid in unique_ids.tolist():
+                    self.critic_optim[aid].step()
+            else:
+                self.critic_optim.zero_grad()
+                avg_critic_loss.backward()
+                self.critic_optim.step()
+            
+            step_loss_critic.append(avg_critic_loss.item())
+
+            total_loss = avg_policy_loss - self.entropy_coef * avg_entropy
+            if isinstance(self.actor_optimizer, list):
+                for aid in unique_ids.tolist():
+                    self.actor_optimizer[aid].zero_grad()
+                total_loss.backward()
+                for aid in unique_ids.tolist():
+                    self.actor_optimizer[aid].step()
+            else:
+                self.actor_optimizer.zero_grad()
+                total_loss.backward()
+                self.actor_optimizer.step()
+            
+            step_loss_actor.append(avg_policy_loss.item())
+
+        if step_loss_critic:
+            self.loss_critic.append(sum(step_loss_critic) / len(step_loss_critic))
+        if step_loss_actor:
+            self.loss_actor.append(sum(step_loss_actor) / len(step_loss_actor))
+            
+        self.memory.clear()
 
     def get_last_observation(self, agent_id: int):
         return self.last_states.get(agent_id, None)
@@ -558,34 +570,48 @@ if __name__ == "__main__":
     print_agent_counts(env)
     obs_size = env.observation_space(env.possible_agents[0]).shape[0]
     
-    # Set policies for machine agents (Identycznie jak w IPPO!)
-    for idx in range(len(env.machine_agents)):
-        agent = env.machine_agents[idx]
-        mask = None
+    # Set policies for machine agents
+    shared_action_space_size = max(agent.action_space_size for agent in env.machine_agents)
+    agent_to_idx = {str(agent.id): idx for idx, agent in enumerate(env.machine_agents)}
+    
+    internal_action_masks = {}
+    for idx, agent in enumerate(env.machine_agents):
+        mask_array = np.zeros(shared_action_space_size, dtype=np.bool_)
         if action_masks is not None:
             key = (int(agent.origin), int(agent.destination))
             if key not in action_masks:
                 key = (agent.origin, agent.destination)
             if key not in action_masks:
-                raise ValueError(
-                    f"Missing action mask for agent {agent.id} "
-                    f"({agent.origin} -> {agent.destination})."
-                )
-            mask = action_masks[key]
+                raise ValueError(f"Missing action mask for agent {agent.id}")
+            valid_mask = action_masks[key]
+            
+            limit = min(len(valid_mask), shared_action_space_size)
+            mask_array[:limit] = valid_mask[:limit]
+        else:
+            mask_array[:agent.action_space_size] = True
+            
+        mask_array[agent.action_space_size:] = False
+        if not mask_array.any():
+            mask_array[0] = True
+            
+        internal_action_masks[idx] = torch.as_tensor(mask_array, dtype=torch.bool, device=device)
 
-        # Bezpieczne stworzenie parametrów z JSON dla MAPPO
-        model_params = params.copy()
-        model_params.update({
-            "state_size": obs_size,
-            "action_space_size": agent.action_space_size,
-            "num_agents": 1,
-            "shared_policy": True,
-            "share_critic": True,
-            "device": device,
-            "action_mask": mask
-        })
-        agent.model = MAPPO(**model_params)
+    model_params = params.copy()
+    model_params.update({
+        "state_size": obs_size,
+        "action_space_size": shared_action_space_size,
+        "num_agents": len(env.machine_agents),
+        "shared_policy": True,
+        "share_critic": True,
+        "device": device,
+        "action_mask": internal_action_masks
+    })
 
+    shared_mappo = MAPPO(**model_params)
+
+    for agent in env.machine_agents:
+        agent.model = shared_mappo
+        
     agent_lookup = {str(agent.id): agent for agent in env.machine_agents}
     
     ### Learning phase ###
@@ -602,9 +628,8 @@ if __name__ == "__main__":
             
             if termination or truncation:
                 if agent_id in agent_lookup:
-                    agent_lookup[agent_id].model.push(agent_id=0, reward=reward)
-                    if episode % update_every == 0:
-                        agent_lookup[agent_id].model.learn()
+                    internal_id = agent_to_idx[str(agent_id)]
+                    shared_mappo.push(agent_id=internal_id, reward=reward)
                 
                 action = None
                 episode_rewards.append(reward)
@@ -612,13 +637,17 @@ if __name__ == "__main__":
                     episode_travel_times.append(info["travel_time"])
             else:
                 if agent_id in agent_lookup:
-                    action = agent_lookup[agent_id].model.act(observation, agent_id=0)
+                    internal_id = agent_to_idx[str(agent_id)]
+                    action = shared_mappo.act(observation, agent_id=internal_id)
                 else:
                     action = None
                 
             env.step(action)
-        
-        episode_losses = [agent.model.loss_actor[-1] for agent in env.machine_agents if len(agent.model.loss_actor) > 0]
+            
+        if episode % update_every == 0:
+            shared_mappo.learn()
+            
+        episode_losses = [shared_mappo.loss_actor[-1]] if len(shared_mappo.loss_actor) > 0 else []
         
         metrics = {"episode": episode + human_learning_episodes}
         if episode_losses:
@@ -655,7 +684,8 @@ if __name__ == "__main__":
                     episode_travel_times.append(info["travel_time"])
             else:
                 if agent_id in agent_lookup:
-                    action = agent_lookup[agent_id].model.act(observation, agent_id=0)
+                    internal_id = agent_to_idx[str(agent_id)]
+                    action = shared_mappo.act(observation, agent_id=internal_id)
                 else:
                     action = None
                 
@@ -678,21 +708,10 @@ if __name__ == "__main__":
     pbar.close()
     env.plot_results()
     
-    loss_records = []
-    for agent in env.machine_agents:
-        for iteration, loss_value in enumerate(agent.model.loss_actor, start=1):
-            loss_records.append(
-                {
-                    "iteration": iteration,
-                    "agent_id": agent.id,
-                    "loss": loss_value,
-                }
-            )
-    save_loss_records(
-        records_folder,
-        loss_records,
-        columns=["iteration", "agent_id", "loss"],
-    )
+    loss_records = [
+        {"iteration": iteration, "agent_id": "shared", "loss": loss_value}
+        for iteration, loss_value in enumerate(shared_mappo.loss_actor, start=1)
+    ]
 
     env.stop_simulation()
     clear_SUMO_files(os.path.join(records_folder, "SUMO_output"), os.path.join(records_folder, "episodes"), remove_additional_files=True)
