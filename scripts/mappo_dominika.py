@@ -293,7 +293,7 @@ class MAPPO(BaseLearningModel):
         return self.policies[agent_id] if agent_id < len(self.policies) else None
 
 
-def main():
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--id', type=str, required=True)
     parser.add_argument('--env-conf', type=str, default="clusters")
@@ -303,14 +303,14 @@ def main():
     parser.add_argument('--env-seed', type=int, default=42)
     parser.add_argument('--torch-seed', type=int, default=42)
     parser.add_argument(
-            '--route-set',
-            type=str,
-            default=None,
-            help="Named route-set subdirectory. Uses the network default when omitted.",
-        )
+        '--route-set',
+        type=str,
+        default="default_pre_integration",
+        help="Named route-set subdirectory. Uses the network default when omitted.",
+    )
     parser.add_argument("--shuffle", action="store_true", default=False)
     args = parser.parse_args()
-    
+
     ALGORITHM = "mappo_dominika"
     exp_id = args.id
     alg_config = args.alg_conf
@@ -319,14 +319,21 @@ def main():
     network = args.net
     env_seed = args.env_seed
     torch_seed = args.torch_seed
+    requested_route_set = args.route_set
+    shuffle = args.shuffle
 
     print("### STARTING EXPERIMENT ###")
     print(f"Algorithm: {ALGORITHM.upper()}")
     print(f"Experiment ID: {exp_id}")
     print(f"Network: {network}")
     print(f"Environment seed: {env_seed}")
+    print(f"Algorithm config: {alg_config}")
+    print(f"Environment config: {env_config}")
+    print(f"Task config: {task_config}")
+    print(f"Requested route set: {requested_route_set or 'network default'}")
+    print(f"Shuffle: {shuffle}")
 
-    os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
+    os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
     logging.getLogger("matplotlib").setLevel(logging.ERROR)
     torch.manual_seed(torch_seed)
     torch.cuda.manual_seed(torch_seed)
@@ -339,6 +346,7 @@ def main():
     device = torch.device(0) if torch.cuda.is_available() else torch.device("cpu")
     print("Device is: ", device)
         
+    # Parameter setting
     params = dict()
     alg_params = json.load(open(f"../config/algo_config/{ALGORITHM}/{alg_config}.json"))
     env_params = json.load(open(f"../config/env_config/{env_config}.json"))
@@ -347,11 +355,24 @@ def main():
     params.update(env_params)
     params.update(task_params)
     del params["desc"], env_params, task_params
-    
-    observation_type = params.get("observation_type", params.get("observations", "previous_agents_plus_start_time"))
+
+    observation_type = params.get(
+        "observation_type",
+        params.get("observations", "previous_agents_plus_start_time"),
+    )
     path_gen_workers_value = params.get("path_gen_workers", 4)
 
-    for key, value in params.items(): globals()[key] = value
+    use_clustered_routes = params.get("use_clustered_routes", False)
+    route_set = (
+        resolve_route_set(network, requested_route_set)
+        if use_clustered_routes
+        else None
+    )
+    print(f"Route set: {route_set or 'none (unclustered)'}")
+
+    # Set params as variables in this script
+    for key, value in params.items():
+        globals()[key] = value
 
     custom_network_folder = f"../networks/{network}"
     phases = [1, human_learning_episodes, int(training_eps) + human_learning_episodes]
@@ -359,12 +380,15 @@ def main():
     records_folder = f"../results/{exp_id}"
     plots_folder = f"../results/{exp_id}/plots"
 
+    # Read origin-destinations
     od_file_path = os.path.join(custom_network_folder, f"od_{network}.txt")
     with open(od_file_path, 'r', encoding='utf-8') as f:
-        data = ast.literal_eval(f.read())
+        content = f.read()
+    data = ast.literal_eval(content)
     origins = data['origins']
     destinations = data['destinations']
 
+    # Copy agents.csv from custom_network_folder to records_folder
     agents_csv_path = os.path.join(custom_network_folder, "agents.csv")
     num_agents = len(pd.read_csv(agents_csv_path))
     if os.path.exists(agents_csv_path):
@@ -376,39 +400,90 @@ def main():
             f.write(content)
         max_start_time = pd.read_csv(new_agents_csv_path)['start_time'].max()
     else:
-        raise FileNotFoundError(f"Agents CSV file not found at {agents_csv_path}.")
+        raise FileNotFoundError(f"Agents CSV file not found at {agents_csv_path}. Please check the network folder.")
             
     num_machines = int(num_agents * ratio_machines)
     total_episodes = human_learning_episodes + training_eps + test_eps
-    
-    use_clustered_routes = params.get("use_clustered_routes", False)
-    route_set = resolve_route_set(network, args.route_set) if use_clustered_routes else None
-    
-    configured_number_of_paths = params.get("number_of_paths", 4)
-    create_paths_flag = True
-    action_masks = None
-    
-    if use_clustered_routes:
-        try:
-            route_set_dir = os.path.join(custom_network_folder, "clustered_routes", route_set)
-            clustered_loader = ClusteredRoutesLoader(network, custom_network_folder, args.shuffle, env_seed, route_set_dir=route_set_dir)
-            configured_number_of_paths = clustered_loader.get_number_of_paths()
-            clustered_loader.export_paths_routes(records_folder, origins, destinations)
-            action_masks = clustered_loader.create_masks(origins, destinations)
-            create_paths_flag = False
-        except FileNotFoundError as e:
-            print(f"[CLUSTERED ROUTES] Warning: {e}")
-            use_clustered_routes = False
             
     # Dump exp config to records
     exp_config_path = os.path.join(records_folder, "exp_config.json")
     dump_config = params.copy()
-    dump_config.update({
-        "network": network, "env_seed": env_seed, "torch_seed": torch_seed,
-        "env_config": env_config, "task_config": task_config, "alg_config": alg_config,
-        "algorithm": ALGORITHM, "num_agents": num_agents, "num_machines": num_machines,
-        "path_gen_workers": path_gen_workers_value
-    })
+
+    # Load pre-generated clustered routes and their per-OD action masks.
+    configured_number_of_paths = number_of_paths
+    create_paths_flag = True
+    action_masks = None
+
+    if use_clustered_routes:
+        try:
+            route_set_dir = os.path.join(custom_network_folder, "clustered_routes", route_set)
+            clustered_loader = ClusteredRoutesLoader(
+                network,
+                custom_network_folder,
+                shuffle,
+                env_seed,
+                route_set_dir=route_set_dir,
+            )
+            number_of_paths = clustered_loader.get_number_of_paths()
+            clustered_loader.export_paths_routes(records_folder, origins, destinations)
+            action_masks = clustered_loader.create_masks(origins, destinations)
+            if not action_masks:
+                raise ValueError("The clustered route set contains no action masks.")
+
+            for od_pair, mask in action_masks.items():
+                mask_array = np.asarray(mask)
+                if mask_array.shape != (number_of_paths,):
+                    raise ValueError(
+                        f"Action mask for OD pair {od_pair} has shape "
+                        f"{mask_array.shape}; expected ({number_of_paths},)."
+                    )
+                if not np.isin(mask_array, (0, 1)).all():
+                    raise ValueError(
+                        f"Action mask for OD pair {od_pair} must be binary."
+                    )
+                if not mask_array.any():
+                    raise ValueError(
+                        f"Action mask for OD pair {od_pair} has no valid actions."
+                    )
+
+            agent_ods = {
+                (int(row.origin), int(row.destination))
+                for row in pd.read_csv(
+                    agents_csv_path,
+                    usecols=["origin", "destination"],
+                ).itertuples()
+            }
+            missing_ods = sorted(agent_ods.difference(action_masks))
+            if missing_ods:
+                raise ValueError(
+                    "Missing action masks for agent OD pairs: "
+                    + ", ".join(map(str, missing_ods))
+                )
+
+            create_paths_flag = False
+            dump_config["number_of_paths"] = number_of_paths
+        except FileNotFoundError as e:
+            use_clustered_routes = False
+            number_of_paths = configured_number_of_paths
+            print(f"[CLUSTERED ROUTES] Warning: {e}")
+            print("[CLUSTERED ROUTES] Falling back to JanuX generation\n")
+
+    dump_config["network"] = network
+    dump_config["env_seed"] = env_seed
+    dump_config["torch_seed"] = torch_seed
+    dump_config["route_set"] = route_set
+    dump_config["env_config"] = env_config
+    dump_config["task_config"] = task_config
+    dump_config["alg_config"] = alg_config
+    dump_config["script"] = script_path_for_config(__file__)
+    dump_config["algorithm"] = ALGORITHM
+    dump_config["num_agents"] = num_agents
+    dump_config["num_machines"] = num_machines
+    dump_config["use_clustered_routes"] = use_clustered_routes
+    dump_config["use_action_masks"] = action_masks is not None
+    dump_config["shuffle"] = shuffle
+    dump_config["observation_type"] = observation_type
+    dump_config["path_gen_workers"] = path_gen_workers_value
     with open(exp_config_path, 'w', encoding='utf-8') as f:
         json.dump(dump_config, f, indent=4)
 
@@ -418,7 +493,8 @@ def main():
         name=exp_id,
         config=dump_config
     )
-        
+
+    # Initialize the environment
     env = TrafficEnvironment(
         seed = env_seed,
         create_agents = False,
@@ -428,26 +504,42 @@ def main():
         agent_parameters = {
             "new_machines_after_mutation": num_machines, 
             "human_parameters": {
-                "model": human_model, "alpha": human_alpha, "beta": human_beta,
-                "beta_randomness": human_beta_randomness, "deterministic": human_deterministic,
+                "model": human_model,
+                "alpha": human_alpha,
+                "beta": human_beta,
+                "beta_randomness": human_beta_randomness,
+                "deterministic": human_deterministic,
             },
             "machine_parameters" : {
-                "behavior" : av_behavior, "observation_type" : observation_type
+                "behavior" : av_behavior,
+                "observation_type" : observation_type
             }
         },
-        environment_parameters = {"save_every" : save_every},
+        environment_parameters = {
+            "save_every" : save_every,
+        },
         simulator_parameters = {
-            "network_name" : network, "custom_network_folder" : custom_network_folder,
-            "sumo_type" : "sumo", "simulation_timesteps" : max_start_time
+            "network_name" : network,
+            "custom_network_folder" : custom_network_folder,
+            "sumo_type" : "sumo",
+            "simulation_timesteps" : max_start_time
         }, 
         plotter_parameters = {
-            "phases" : phases, "phase_names" : phase_names, "smooth_by" : smooth_by,
-            "plot_choices" : plot_choices, "records_folder" : records_folder, "plots_folder" : plots_folder
+            "phases" : phases,
+            "phase_names" : phase_names,
+            "smooth_by" : smooth_by,
+            "plot_choices" : plot_choices,
+            "records_folder" : records_folder,
+            "plots_folder" : plots_folder
         },
         path_generation_parameters = {
-            "origins" : origins, "destinations" : destinations, "number_of_paths" : configured_number_of_paths,
-            "beta" : path_gen_beta, "num_samples" : num_samples, 
-            "path_gen_workers" : path_gen_workers_value, "visualize_paths" : False
+            "origins" : origins,
+            "destinations" : destinations,
+            "number_of_paths" : number_of_paths,
+            "beta" : path_gen_beta,
+            "num_samples" : num_samples,
+            "path_gen_workers" : path_gen_workers_value,
+            "visualize_paths" : False
         } 
     )
 
@@ -466,15 +558,22 @@ def main():
     print_agent_counts(env)
     obs_size = env.observation_space(env.possible_agents[0]).shape[0]
     
-    # Set policies for machine agents
+    # Set policies for machine agents (Identycznie jak w IPPO!)
     for idx in range(len(env.machine_agents)):
         agent = env.machine_agents[idx]
-
         mask = None
         if action_masks is not None:
-            key = (agent.origin, agent.destination)
-            mask = action_masks.get(key, None)
+            key = (int(agent.origin), int(agent.destination))
+            if key not in action_masks:
+                key = (agent.origin, agent.destination)
+            if key not in action_masks:
+                raise ValueError(
+                    f"Missing action mask for agent {agent.id} "
+                    f"({agent.origin} -> {agent.destination})."
+                )
+            mask = action_masks[key]
 
+        # Bezpieczne stworzenie parametrów z JSON dla MAPPO
         model_params = params.copy()
         model_params.update({
             "state_size": obs_size,
@@ -485,9 +584,8 @@ def main():
             "device": device,
             "action_mask": mask
         })
-
         agent.model = MAPPO(**model_params)
-        
+
     agent_lookup = {str(agent.id): agent for agent in env.machine_agents}
     
     ### Learning phase ###
@@ -495,25 +593,28 @@ def main():
     os.makedirs(plots_folder, exist_ok=True)
     for episode in range(training_eps):
         env.reset()
+        
         episode_rewards = []
         episode_travel_times = []
         
         for agent_id in env.agent_iter():
             observation, reward, termination, truncation, info = env.last()
             
-            if agent_id not in agent_lookup:
-                action = None
-            elif termination or truncation:
-                agent_lookup[agent_id].model.push(agent_id=0, reward=reward) # Poprawione argumenty push
-                if episode % update_every == 0:
-                    agent_lookup[agent_id].model.learn()
-                action = None
+            if termination or truncation:
+                if agent_id in agent_lookup:
+                    agent_lookup[agent_id].model.push(agent_id=0, reward=reward)
+                    if episode % update_every == 0:
+                        agent_lookup[agent_id].model.learn()
                 
+                action = None
                 episode_rewards.append(reward)
                 if "travel_time" in info:
                     episode_travel_times.append(info["travel_time"])
             else:
-                action = agent_lookup[agent_id].model.act(observation, agent_id=0)
+                if agent_id in agent_lookup:
+                    action = agent_lookup[agent_id].model.act(observation, agent_id=0)
+                else:
+                    action = None
                 
             env.step(action)
         
@@ -523,8 +624,8 @@ def main():
         if episode_losses:
             metrics["train/avg_loss"] = sum(episode_losses) / len(episode_losses)
             
-        metrics["train/reward_sum"] = float(np.sum(episode_rewards)) if episode_rewards else 0.0
-        metrics["train/reward_mean"] = float(np.mean(episode_rewards)) if episode_rewards else 0.0
+        metrics["train/reward_sum"] = float(np.sum(episode_rewards))
+        metrics["train/reward_mean"] = float(np.mean(episode_rewards))
         metrics["train/travel_time_mean"] = float(np.mean(episode_travel_times)) if episode_travel_times else 0.0
             
         wandb.log(metrics)
@@ -540,60 +641,61 @@ def main():
     pbar.set_description("Testing")
     for episode in range(test_eps):
         env.reset()
+        
         episode_rewards = []
         episode_travel_times = []
         
         for agent_id in env.agent_iter():
             observation, reward, termination, truncation, info = env.last()
             
-            if agent_id not in agent_lookup or termination or truncation:
+            if termination or truncation:
                 action = None
-                if agent_id in agent_lookup:
-                    episode_rewards.append(reward)
-                    if "travel_time" in info:
-                        episode_travel_times.append(info["travel_time"])
+                episode_rewards.append(reward)
+                if "travel_time" in info:
+                    episode_travel_times.append(info["travel_time"])
             else:
-                action = agent_lookup[agent_id].model.act(observation, agent_id=0)
+                if agent_id in agent_lookup:
+                    action = agent_lookup[agent_id].model.act(observation, agent_id=0)
+                else:
+                    action = None
                 
             env.step(action)
             
         wandb.log(
             {
                 "episode": human_learning_episodes + training_eps + episode,
-                "testing/reward_sum": float(np.sum(episode_rewards)) if episode_rewards else 0.0,
-                "testing/reward_mean": float(np.mean(episode_rewards)) if episode_rewards else 0.0,
+                "testing/reward_sum": float(np.sum(episode_rewards)),
+                "testing/reward_mean": float(np.mean(episode_rewards)),
                 "testing/travel_time_mean": float(np.mean(episode_travel_times)) if episode_travel_times else 0.0,
                 "testing/travel_time_sum": float(np.sum(episode_travel_times)) if episode_travel_times else 0.0,
             },
             step=human_learning_episodes + training_eps + episode,
         )
+        
         pbar.update()
     
     # Finalize the experiment
     pbar.close()
     env.plot_results()
     
-    plot_files = ["rewards.png", "travel_times.png"] 
-    images_to_log = {}
-    for plot_file in plot_files:
-        plot_path = os.path.join(plots_folder, plot_file)
-        if os.path.exists(plot_path):
-            plot_name = f"plots/{plot_file.replace('.png', '')}"
-            images_to_log[plot_name] = wandb.Image(plot_path)
-            
-    if images_to_log:
-        wandb.log(images_to_log)
-
     loss_records = []
     for agent in env.machine_agents:
         for iteration, loss_value in enumerate(agent.model.loss_actor, start=1):
-            loss_records.append({"iteration": iteration, "agent_id": agent.id, "loss": loss_value})
-            
-    save_loss_records(records_folder, loss_records, columns=["iteration", "agent_id", "loss"])
+            loss_records.append(
+                {
+                    "iteration": iteration,
+                    "agent_id": agent.id,
+                    "loss": loss_value,
+                }
+            )
+    save_loss_records(
+        records_folder,
+        loss_records,
+        columns=["iteration", "agent_id", "loss"],
+    )
+
     env.stop_simulation()
     clear_SUMO_files(os.path.join(records_folder, "SUMO_output"), os.path.join(records_folder, "episodes"), remove_additional_files=True)
     run_metrics_analysis(exp_id, results_folder="../results")
+    
     wandb.finish()
-
-if __name__ == "__main__":
-    main()
