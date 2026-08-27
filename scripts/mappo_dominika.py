@@ -295,12 +295,19 @@ class MAPPO(BaseLearningModel):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--id', type=str, required=True)
-    parser.add_argument('--env-conf', type=str, default="config1")
+    parser.add_argument('--env-conf', type=str, default="clusters")
     parser.add_argument('--task-conf', type=str, required=True)
     parser.add_argument('--alg-conf', type=str, required=True)
     parser.add_argument('--net', type=str, required=True)
     parser.add_argument('--env-seed', type=int, default=42)
     parser.add_argument('--torch-seed', type=int, default=42)
+    parser.add_argument(
+            '--route-set',
+            type=str,
+            default=None,
+            help="Named route-set subdirectory. Uses the network default when omitted.",
+        )
+    parser.add_argument("--shuffle", action="store_true", default=False)
     args = parser.parse_args()
     
     ALGORITHM = "mappo_dominika"
@@ -372,6 +379,25 @@ def main():
             
     num_machines = int(num_agents * ratio_machines)
     total_episodes = human_learning_episodes + training_eps + test_eps
+    
+    use_clustered_routes = params.get("use_clustered_routes", False)
+    route_set = resolve_route_set(network, args.route_set) if use_clustered_routes else None
+    
+    configured_number_of_paths = params.get("number_of_paths", 4)
+    create_paths_flag = True
+    action_masks = None
+    
+    if use_clustered_routes:
+        try:
+            route_set_dir = os.path.join(custom_network_folder, "clustered_routes", route_set)
+            clustered_loader = ClusteredRoutesLoader(network, custom_network_folder, args.shuffle, env_seed, route_set_dir=route_set_dir)
+            configured_number_of_paths = clustered_loader.get_number_of_paths()
+            clustered_loader.export_paths_routes(records_folder, origins, destinations)
+            action_masks = clustered_loader.create_masks(origins, destinations)
+            create_paths_flag = False
+        except FileNotFoundError as e:
+            print(f"[CLUSTERED ROUTES] Warning: {e}")
+            use_clustered_routes = False
             
     # Dump exp config to records
     exp_config_path = os.path.join(records_folder, "exp_config.json")
@@ -395,7 +421,8 @@ def main():
     env = TrafficEnvironment(
         seed = env_seed,
         create_agents = False,
-        create_paths = True,
+        create_paths = create_paths_flag,
+        action_masks = action_masks,
         save_detectors_info = False,
         agent_parameters = {
             "new_machines_after_mutation": num_machines, 
@@ -417,7 +444,7 @@ def main():
             "plot_choices" : plot_choices, "records_folder" : records_folder, "plots_folder" : plots_folder
         },
         path_generation_parameters = {
-            "origins" : origins, "destinations" : destinations, "number_of_paths" : params.get("number_of_paths", 4),
+            "origins" : origins, "destinations" : destinations, "number_of_paths" : configured_number_of_paths,
             "beta" : path_gen_beta, "num_samples" : num_samples, 
             "path_gen_workers" : path_gen_workers_value, "visualize_paths" : False
         } 
@@ -441,7 +468,12 @@ def main():
     # Set policies for machine agents
     for idx in range(len(env.machine_agents)):
         agent = env.machine_agents[idx]
-        
+
+        mask = None
+        if action_masks is not None:
+            key = (agent.origin, agent.destination)
+            mask = action_masks.get(key, None)
+
         model_params = params.copy()
         model_params.update({
             "state_size": obs_size,
@@ -449,9 +481,10 @@ def main():
             "num_agents": 1,
             "shared_policy": True,
             "share_critic": True,
-            "device": device
+            "device": device,
+            "action_mask": mask
         })
-        
+
         agent.model = MAPPO(**model_params)
         
     agent_lookup = {str(agent.id): agent for agent in env.machine_agents}
