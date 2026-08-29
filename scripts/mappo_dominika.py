@@ -59,6 +59,7 @@ class MAPPO(BaseLearningModel):
         batch_size: int = 64,
         memory_size: int = 5000,
         device: torch.device | None = None,
+        action_mask: dict | None = None,
         **kwargs
     ):
         super().__init__()
@@ -67,24 +68,25 @@ class MAPPO(BaseLearningModel):
         self.state_size = state_size
         self.action_space_size = action_space_size
         self.num_agents = num_agents
+        
+        self.action_masks = action_mask or {}
+
         self.num_epochs = kwargs.get("num_epochs", 4)
+        ws = kwargs.get("widths", default_widths)
+        self.clip_ratio = kwargs.get("clip_eps", clip_ratio)
+        lr_actor = kwargs.get("lr", lr_actor)
+        lr_critic = kwargs.get("lr", lr_critic)
+        self.entropy_coef = kwargs.get("entropy_coef", entropy_coef)
+        self.value_coef = kwargs.get("value_coef", value_coef)
+        self.batch_size = kwargs.get("batch_size", batch_size)
+        self.memory = deque(maxlen=kwargs.get("memory_size", memory_size))
 
         # training phase flag
         self.training = True
-        
-        # hyperparameters
         self.gamma = gamma
-        self.clip_ratio = clip_ratio
-        self.entropy_coef = entropy_coef
-        self.value_coef = value_coef
-        self.batch_size = batch_size
-        self.memory = deque(maxlen=memory_size)
         self.last_states = {}
         self.last_actions = {}
         self.last_log_probs = {}
-
-        # architecture args
-        ws = default_widths if policy_arch_kwargs is None else policy_arch_kwargs.get('widths', default_widths)
 
         # --- Policy networks ---
         if policy_nets is not None:
@@ -111,8 +113,8 @@ class MAPPO(BaseLearningModel):
                 "If critic_nets is provided, it must match the number of agents or be shared."
             self.critics = [net.to(self.device) for net in (critic_nets if not share_critic else [critic_nets[0]] * num_agents)]
         else:
-            # build critics using generic Network class
-            ch_ws = critic_arch_kwargs.get('widths', default_widths) if critic_arch_kwargs else default_widths
+            # build critics using generic Network class (używamy tej samej sieci co dla aktora, czyli 'ws')
+            ch_ws = kwargs.get("widths", default_widths)
             self.critics = []
             for _ in range(num_agents):
                 net = Network(state_size, 1, len(ch_ws) - 1, ch_ws).to(self.device)
