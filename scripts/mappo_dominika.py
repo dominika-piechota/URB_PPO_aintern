@@ -68,9 +68,11 @@ class MAPPO(BaseLearningModel):
         self.state_size = state_size
         self.action_space_size = action_space_size
         self.num_agents = num_agents
-        
+
+        # Zapisanie maski z argumentów
         self.action_masks = action_mask or {}
 
+        # CZYTANIE PARAMETRÓW Z JSON
         self.num_epochs = kwargs.get("num_epochs", 4)
         ws = kwargs.get("widths", default_widths)
         self.clip_ratio = kwargs.get("clip_eps", clip_ratio)
@@ -113,7 +115,7 @@ class MAPPO(BaseLearningModel):
                 "If critic_nets is provided, it must match the number of agents or be shared."
             self.critics = [net.to(self.device) for net in (critic_nets if not share_critic else [critic_nets[0]] * num_agents)]
         else:
-            # build critics using generic Network class (używamy tej samej sieci co dla aktora, czyli 'ws')
+            # build critics using generic Network class (używamy szerokości z kwargs)
             ch_ws = kwargs.get("widths", default_widths)
             self.critics = []
             for _ in range(num_agents):
@@ -175,6 +177,9 @@ class MAPPO(BaseLearningModel):
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         with torch.no_grad():
             logits = self.policies[agent_id](state_tensor)
+            mask = self.action_masks.get(agent_id, None) 
+            if mask is not None:
+                logits = logits.masked_fill(~mask, float("-inf"))
             dist = torch.distributions.Categorical(logits=logits)
             action = dist.sample().item() if self.training else torch.argmax(logits).item()
         log_prob = dist.log_prob(torch.tensor(action, device=self.device)).item()
@@ -231,12 +236,14 @@ class MAPPO(BaseLearningModel):
                 old_log_probs_tensor_a = old_log_probs_tensor[mask]
                 dones_tensor_a = dones_tensor[mask]
 
+                # critic forward
                 values = self.critics[aid](states_tensor_a)
                 next_values = self.critics[aid](next_states_tensor_a)
                 with torch.no_grad():
                     targets = rewards_tensor_a + self.gamma * next_values * (1 - dones_tensor_a)
                 critic_loss = nn.MSELoss()(values, targets)
 
+                # policy forward
                 logits = self.policies[aid](states_tensor_a)
                 mask_action = self.action_masks.get(aid, None)
                 if mask_action is not None:
