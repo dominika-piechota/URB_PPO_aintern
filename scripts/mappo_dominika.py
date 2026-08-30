@@ -335,6 +335,8 @@ def main():
     network = args.net
     env_seed = args.env_seed
     torch_seed = args.torch_seed
+    requested_route_set = args.route_set
+    shuffle = args.shuffle
 
     print("### STARTING EXPERIMENT ###")
     print(f"Algorithm: {ALGORITHM.upper()}")
