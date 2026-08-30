@@ -48,7 +48,7 @@ class MAPPO(BaseLearningModel):
         critic_nets: list[nn.Module] | None = None,
         critic_arch_kwargs: dict | None = None,
         # --- default architecture parameters ---
-        default_widths: list[int] = [32, 64, 32],
+        default_widths: list[int] = [64,64],
         # --- hyperparameters ---
         gamma: float = 0.99,
         clip_ratio: float = 0.2,
@@ -64,28 +64,28 @@ class MAPPO(BaseLearningModel):
     ):
         super().__init__()
         # device setup 
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device or torch.device("cpu")
         self.state_size = state_size
         self.action_space_size = action_space_size
         self.num_agents = num_agents
-
-        # Zapisanie maski z argumentów
-        self.action_masks = action_mask or {}
-
-        # CZYTANIE PARAMETRÓW Z JSON
-        self.num_epochs = kwargs.get("num_epochs", 4)
+        
+        # --- ZAPISANIE MASKI I PARAMETRÓW Z JSON ---
+        self.action_masks = kwargs.get("action_mask", {})
+        self.num_epochs = kwargs.get("num_epochs", 3)
         ws = kwargs.get("widths", default_widths)
         self.clip_ratio = kwargs.get("clip_eps", clip_ratio)
         lr_actor = kwargs.get("lr", lr_actor)
         lr_critic = kwargs.get("lr", lr_critic)
+
+        # training phase flag
+        self.training = True
+        
+        # hyperparameters
+        self.gamma = gamma
         self.entropy_coef = kwargs.get("entropy_coef", entropy_coef)
         self.value_coef = kwargs.get("value_coef", value_coef)
         self.batch_size = kwargs.get("batch_size", batch_size)
         self.memory = deque(maxlen=kwargs.get("memory_size", memory_size))
-
-        # training phase flag
-        self.training = True
-        self.gamma = gamma
         self.last_states = {}
         self.last_actions = {}
         self.last_log_probs = {}
@@ -115,8 +115,8 @@ class MAPPO(BaseLearningModel):
                 "If critic_nets is provided, it must match the number of agents or be shared."
             self.critics = [net.to(self.device) for net in (critic_nets if not share_critic else [critic_nets[0]] * num_agents)]
         else:
-            # build critics using generic Network class (używamy szerokości z kwargs)
-            ch_ws = kwargs.get("widths", default_widths)
+            # build critics using generic Network class
+            ch_ws = critic_arch_kwargs.get('widths', default_widths) if critic_arch_kwargs else default_widths
             self.critics = []
             for _ in range(num_agents):
                 net = Network(state_size, 1, len(ch_ws) - 1, ch_ws).to(self.device)
@@ -177,9 +177,6 @@ class MAPPO(BaseLearningModel):
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         with torch.no_grad():
             logits = self.policies[agent_id](state_tensor)
-            mask = self.action_masks.get(agent_id, None) 
-            if mask is not None:
-                logits = logits.masked_fill(~mask, float("-inf"))
             dist = torch.distributions.Categorical(logits=logits)
             action = dist.sample().item() if self.training else torch.argmax(logits).item()
         log_prob = dist.log_prob(torch.tensor(action, device=self.device)).item()
@@ -236,14 +233,12 @@ class MAPPO(BaseLearningModel):
                 old_log_probs_tensor_a = old_log_probs_tensor[mask]
                 dones_tensor_a = dones_tensor[mask]
 
-                # critic forward
                 values = self.critics[aid](states_tensor_a)
                 next_values = self.critics[aid](next_states_tensor_a)
                 with torch.no_grad():
                     targets = rewards_tensor_a + self.gamma * next_values * (1 - dones_tensor_a)
                 critic_loss = nn.MSELoss()(values, targets)
 
-                # policy forward
                 logits = self.policies[aid](states_tensor_a)
                 mask_action = self.action_masks.get(aid, None)
                 if mask_action is not None:
@@ -314,7 +309,7 @@ class MAPPO(BaseLearningModel):
         return self.policies[agent_id] if agent_id < len(self.policies) else None
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--id', type=str, required=True)
     parser.add_argument('--env-conf', type=str, default="clusters")
@@ -324,14 +319,14 @@ if __name__ == "__main__":
     parser.add_argument('--env-seed', type=int, default=42)
     parser.add_argument('--torch-seed', type=int, default=42)
     parser.add_argument(
-        '--route-set',
-        type=str,
-        default="default_pre_integration",
-        help="Named route-set subdirectory. Uses the network default when omitted.",
-    )
+            '--route-set',
+            type=str,
+            default=None,
+            help="Named route-set subdirectory. Uses the network default when omitted.",
+        )
     parser.add_argument("--shuffle", action="store_true", default=False)
     args = parser.parse_args()
-
+    
     ALGORITHM = "mappo_dominika"
     exp_id = args.id
     alg_config = args.alg_conf
@@ -340,8 +335,6 @@ if __name__ == "__main__":
     network = args.net
     env_seed = args.env_seed
     torch_seed = args.torch_seed
-    requested_route_set = args.route_set
-    shuffle = args.shuffle
 
     print("### STARTING EXPERIMENT ###")
     print(f"Algorithm: {ALGORITHM.upper()}")
@@ -354,7 +347,7 @@ if __name__ == "__main__":
     print(f"Requested route set: {requested_route_set or 'network default'}")
     print(f"Shuffle: {shuffle}")
 
-    os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+    os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
     logging.getLogger("matplotlib").setLevel(logging.ERROR)
     torch.manual_seed(torch_seed)
     torch.cuda.manual_seed(torch_seed)
@@ -364,10 +357,13 @@ if __name__ == "__main__":
     random.seed(env_seed)
     np.random.seed(env_seed)
 
-    device = torch.device(0) if torch.cuda.is_available() else torch.device("cpu")
+    device = (
+        torch.device(0)
+        if torch.cuda.is_available()
+        else torch.device("cpu")
+    )
     print("Device is: ", device)
         
-    # Parameter setting
     params = dict()
     alg_params = json.load(open(f"../config/algo_config/{ALGORITHM}/{alg_config}.json"))
     env_params = json.load(open(f"../config/env_config/{env_config}.json"))
@@ -376,7 +372,7 @@ if __name__ == "__main__":
     params.update(env_params)
     params.update(task_params)
     del params["desc"], env_params, task_params
-
+    
     observation_type = params.get(
         "observation_type",
         params.get("observations", "previous_agents_plus_start_time"),
@@ -391,10 +387,10 @@ if __name__ == "__main__":
     )
     print(f"Route set: {route_set or 'none (unclustered)'}")
 
-    # Set params as variables in this script
+    # set params as variables in this script
     for key, value in params.items():
         globals()[key] = value
-
+        
     custom_network_folder = f"../networks/{network}"
     phases = [1, human_learning_episodes, int(training_eps) + human_learning_episodes]
     phase_names = ["Human stabilization", "Mutation and AV learning", "Testing phase"]
@@ -409,7 +405,6 @@ if __name__ == "__main__":
     origins = data['origins']
     destinations = data['destinations']
 
-    # Copy agents.csv from custom_network_folder to records_folder
     agents_csv_path = os.path.join(custom_network_folder, "agents.csv")
     num_agents = len(pd.read_csv(agents_csv_path))
     if os.path.exists(agents_csv_path):
@@ -421,20 +416,20 @@ if __name__ == "__main__":
             f.write(content)
         max_start_time = pd.read_csv(new_agents_csv_path)['start_time'].max()
     else:
-        raise FileNotFoundError(f"Agents CSV file not found at {agents_csv_path}. Please check the network folder.")
+        raise FileNotFoundError(f"Agents CSV file not found at {agents_csv_path}.")
             
     num_machines = int(num_agents * ratio_machines)
     total_episodes = human_learning_episodes + training_eps + test_eps
-            
+    
     # Dump exp config to records
     exp_config_path = os.path.join(records_folder, "exp_config.json")
     dump_config = params.copy()
-
+    
     # Load pre-generated clustered routes and their per-OD action masks.
     configured_number_of_paths = number_of_paths
     create_paths_flag = True
     action_masks = None
-
+    
     if use_clustered_routes:
         try:
             route_set_dir = os.path.join(custom_network_folder, "clustered_routes", route_set)
@@ -509,12 +504,14 @@ if __name__ == "__main__":
         json.dump(dump_config, f, indent=4)
 
     wandb.init(
+        # Set the wandb entity where your project will be logged (generally your team name).
         entity="aintern26coexistence",
+        # Set the wandb project where this run will be logged.
         project="PPO Enhancement",
         name=exp_id,
         config=dump_config
     )
-
+    
     # Initialize the environment
     env = TrafficEnvironment(
         seed = env_seed,
@@ -579,7 +576,7 @@ if __name__ == "__main__":
     print_agent_counts(env)
     obs_size = env.observation_space(env.possible_agents[0]).shape[0]
     
-    # Set policies for machine agents
+    # Set policies for machine agents (Wspólny model)
     shared_action_space_size = max(agent.action_space_size for agent in env.machine_agents)
     agent_to_idx = {str(agent.id): idx for idx, agent in enumerate(env.machine_agents)}
     
@@ -628,7 +625,6 @@ if __name__ == "__main__":
     os.makedirs(plots_folder, exist_ok=True)
     for episode in range(training_eps):
         env.reset()
-        
         episode_rewards = []
         episode_travel_times = []
         
@@ -657,13 +653,12 @@ if __name__ == "__main__":
             shared_mappo.learn()
             
         episode_losses = [shared_mappo.loss_actor[-1]] if len(shared_mappo.loss_actor) > 0 else []
-        
         metrics = {"episode": episode + human_learning_episodes}
         if episode_losses:
             metrics["train/avg_loss"] = sum(episode_losses) / len(episode_losses)
             
-        metrics["train/reward_sum"] = float(np.sum(episode_rewards))
-        metrics["train/reward_mean"] = float(np.mean(episode_rewards))
+        metrics["train/reward_sum"] = float(np.sum(episode_rewards)) if episode_rewards else 0.0
+        metrics["train/reward_mean"] = float(np.mean(episode_rewards)) if episode_rewards else 0.0
         metrics["train/travel_time_mean"] = float(np.mean(episode_travel_times)) if episode_travel_times else 0.0
             
         wandb.log(metrics)
@@ -679,18 +674,18 @@ if __name__ == "__main__":
     pbar.set_description("Testing")
     for episode in range(test_eps):
         env.reset()
-        
         episode_rewards = []
         episode_travel_times = []
         
         for agent_id in env.agent_iter():
             observation, reward, termination, truncation, info = env.last()
             
-            if termination or truncation:
+            if agent_id not in agent_lookup or termination or truncation:
                 action = None
-                episode_rewards.append(reward)
-                if "travel_time" in info:
-                    episode_travel_times.append(info["travel_time"])
+                if agent_id in agent_lookup:
+                    episode_rewards.append(reward)
+                    if "travel_time" in info:
+                        episode_travel_times.append(info["travel_time"])
             else:
                 if agent_id in agent_lookup:
                     internal_id = agent_to_idx[str(agent_id)]
@@ -703,27 +698,45 @@ if __name__ == "__main__":
         wandb.log(
             {
                 "episode": human_learning_episodes + training_eps + episode,
-                "testing/reward_sum": float(np.sum(episode_rewards)),
-                "testing/reward_mean": float(np.mean(episode_rewards)),
+                "testing/reward_sum": float(np.sum(episode_rewards)) if episode_rewards else 0.0,
+                "testing/reward_mean": float(np.mean(episode_rewards)) if episode_rewards else 0.0,
                 "testing/travel_time_mean": float(np.mean(episode_travel_times)) if episode_travel_times else 0.0,
                 "testing/travel_time_sum": float(np.sum(episode_travel_times)) if episode_travel_times else 0.0,
             },
             step=human_learning_episodes + training_eps + episode,
         )
-        
         pbar.update()
     
     # Finalize the experiment
     pbar.close()
     env.plot_results()
     
+    plot_files = ["rewards.png", "travel_times.png"] 
+    images_to_log = {}
+    for plot_file in plot_files:
+        plot_path = os.path.join(plots_folder, plot_file)
+        if os.path.exists(plot_path):
+            plot_name = f"plots/{plot_file.replace('.png', '')}"
+            images_to_log[plot_name] = wandb.Image(plot_path)
+            
+    if images_to_log:
+        wandb.log(images_to_log)
+
     loss_records = [
         {"iteration": iteration, "agent_id": "shared", "loss": loss_value}
         for iteration, loss_value in enumerate(shared_mappo.loss_actor, start=1)
     ]
+            
+    save_loss_records(
+        records_folder,
+        loss_records,
+        columns=["iteration", "agent_id", "loss"],
+    )
 
     env.stop_simulation()
     clear_SUMO_files(os.path.join(records_folder, "SUMO_output"), os.path.join(records_folder, "episodes"), remove_additional_files=True)
     run_metrics_analysis(exp_id, results_folder="../results")
-    
     wandb.finish()
+
+if __name__ == "__main__":
+    main()
