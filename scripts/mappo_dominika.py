@@ -428,7 +428,8 @@ def main():
     dump_config = params.copy()
     
     # Load pre-generated clustered routes and their per-OD action masks.
-    configured_number_of_paths = number_of_paths
+    configured_number_of_paths = params.get("number_of_paths", 4)
+    number_of_paths = configured_number_of_paths
     create_paths_flag = True
     action_masks = None
     
