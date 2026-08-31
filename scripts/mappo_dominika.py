@@ -242,7 +242,10 @@ class MAPPO(BaseLearningModel):
                 logits = self.policies[aid](states_tensor_a)
                 mask_action = self.action_masks.get(aid, None)
                 if mask_action is not None:
-                    logits = logits.masked_fill(~mask_action.unsqueeze(0), float("-inf"))
+                    logits = logits.masked_fill(
+                                    ~self.action_mask.unsqueeze(0),
+                                    float("-inf"),
+                                )
                 dist = torch.distributions.Categorical(logits=logits)
                 new_log_probs = dist.log_prob(actions_tensor_a.squeeze(1)).unsqueeze(1)
                 ratios = torch.exp(new_log_probs - old_log_probs_tensor_a)
@@ -579,29 +582,29 @@ def main():
     print_agent_counts(env)
     obs_size = env.observation_space(env.possible_agents[0]).shape[0]
     
-    # Set policies for machine agents (Wspólny model)
+    # Set policies for machine agents
     shared_action_space_size = max(agent.action_space_size for agent in env.machine_agents)
     agent_to_idx = {str(agent.id): idx for idx, agent in enumerate(env.machine_agents)}
     
     internal_action_masks = {}
-    for idx, agent in enumerate(env.machine_agents):
-        mask_array = np.zeros(shared_action_space_size, dtype=np.bool_)
+    for idx in range(len(env.machine_agents)):
+        agent = env.machine_agents[idx]
+        
+        mask = None
         if action_masks is not None:
-            key = (int(agent.origin), int(agent.destination))
+            key = (agent.origin, agent.destination)
             if key not in action_masks:
-                key = (agent.origin, agent.destination)
-            if key not in action_masks:
-                raise ValueError(f"Missing action mask for agent {agent.id}")
-            valid_mask = action_masks[key]
+                raise ValueError(
+                    f"Missing action mask for agent {agent.id} "
+                    f"({agent.origin} -> {agent.destination})."
+                )
+            mask = action_masks[key]
             
-            limit = min(len(valid_mask), shared_action_space_size)
-            mask_array[:limit] = valid_mask[:limit]
+        mask_array = np.zeros(shared_action_space_size, dtype=np.bool_)
+        if mask is not None:
+            mask_array[:len(mask)] = mask
         else:
             mask_array[:agent.action_space_size] = True
-            
-        mask_array[agent.action_space_size:] = False
-        if not mask_array.any():
-            mask_array[0] = True
             
         internal_action_masks[idx] = torch.as_tensor(mask_array, dtype=torch.bool, device=device)
 
