@@ -177,6 +177,11 @@ class MAPPO(BaseLearningModel):
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         with torch.no_grad():
             logits = self.policies[agent_id](state_tensor)
+            
+            mask = self.action_masks.get(agent_id, None)
+            if mask is not None:
+                logits = logits.masked_fill(~mask.unsqueeze(0), float("-inf"))
+                
             dist = torch.distributions.Categorical(logits=logits)
             action = dist.sample().item() if self.training else torch.argmax(logits).item()
         log_prob = dist.log_prob(torch.tensor(action, device=self.device)).item()
