@@ -108,6 +108,7 @@ class MAPPO(BaseLearningModel):
             self.actor_optimizer = optim.Adam(self.policies[0].parameters(), lr=lr_actor)
         else:
             self.actor_optimizer = [optim.Adam(policy.parameters(), lr=lr_actor) for policy in self.policies]
+        self.softmax = nn.Softmax(dim=-1)
         
         # --- Critic networks ---
         if critic_nets is not None:
@@ -182,8 +183,8 @@ class MAPPO(BaseLearningModel):
             if mask is not None:
                 logits = logits.masked_fill(~mask.unsqueeze(0), float("-inf"))
                 
-            dist = torch.distributions.Categorical(logits=logits)
-            action = dist.sample().item() if self.training else torch.argmax(logits).item()
+            dist = torch.distributions.Categorical(probs=self.softmax(logits))
+            action = dist.sample().item() if self.training else torch.argmax(dist.probs).item()
         log_prob = dist.log_prob(torch.tensor(action, device=self.device)).item()
 
         self.last_states[agent_id] = state
@@ -248,10 +249,10 @@ class MAPPO(BaseLearningModel):
                 mask_action = self.action_masks.get(aid, None)
                 if mask_action is not None:
                     logits = logits.masked_fill(
-                                    ~self.action_mask.unsqueeze(0),
+                                    ~mask_action.unsqueeze(0),
                                     float("-inf"),
                                 )
-                dist = torch.distributions.Categorical(logits=logits)
+                dist = torch.distributions.Categorical(probs=self.softmax(logits))
                 new_log_probs = dist.log_prob(actions_tensor_a.squeeze(1)).unsqueeze(1)
                 ratios = torch.exp(new_log_probs - old_log_probs_tensor_a)
                 clipped_ratios = torch.clamp(ratios, 1 - self.clip_ratio, 1 + self.clip_ratio)
@@ -599,20 +600,18 @@ def main():
         if action_masks is not None:
             key = (agent.origin, agent.destination)
             if key not in action_masks:
-                raise ValueError(
-                    f"Missing action mask for agent {agent.id} "
-                    f"({agent.origin} -> {agent.destination})."
-                )
+                raise ValueError(f"Missing action mask for agent {agent.id}")
             mask = action_masks[key]
             
-        mask_array = np.zeros(shared_action_space_size, dtype=np.bool_)
         if mask is not None:
-            mask_array[:len(mask)] = mask
-        else:
-            mask_array[:agent.action_space_size] = True
+            padded_mask = list(mask) + [0] * (shared_action_space_size - len(mask))
+            internal_action_masks[idx] = torch.as_tensor(padded_mask, dtype=torch.bool, device=device)
             
-        internal_action_masks[idx] = torch.as_tensor(mask_array, dtype=torch.bool, device=device)
-
+            if not torch.any(internal_action_masks[idx]).item():
+                raise ValueError("Action mask must contain at least one valid action.")
+        else:
+            internal_action_masks[idx] = None
+            
     model_params = params.copy()
     model_params.update({
         "state_size": obs_size,
