@@ -205,12 +205,10 @@ class MAPPO(BaseLearningModel):
         step_loss_actor = []
         step_loss_critic = []
 
-        # W PPO uczymy się przez kilka epok na zebranym batchu
         for _ in range(self.num_epochs):
             batch = random.sample(self.memory, self.batch_size)
             s_batch, a_batch, r_batch, lp_batch, ns_batch, d_batch, id_batch = zip(*batch)
 
-            # (Drobna poprawka: np.array() zapobiega spowolnieniom PyTorcha przy listach)
             states_tensor = torch.FloatTensor(np.array(s_batch)).to(self.device)
             actions_tensor = torch.LongTensor(a_batch).unsqueeze(1).to(self.device)
             rewards_tensor = torch.FloatTensor(r_batch).unsqueeze(1).to(self.device)
@@ -226,7 +224,6 @@ class MAPPO(BaseLearningModel):
             total_entropy = 0.0
             total_count = 0
 
-            # --- PĘTLA WYDLICZAJĄCA (STRUKTURA JAK W TWOIM KODZIE) ---
             for aid in unique_ids.tolist():
                 mask = (id_tensor == aid)
                 states_tensor_a = states_tensor[mask]
@@ -236,39 +233,21 @@ class MAPPO(BaseLearningModel):
                 old_log_probs_tensor_a = old_log_probs_tensor[mask]
                 dones_tensor_a = dones_tensor[mask]
 
-                # critic forward
                 values = self.critics[aid](states_tensor_a)
                 next_values = self.critics[aid](next_states_tensor_a)
                 with torch.no_grad():
                     targets = rewards_tensor_a + self.gamma * next_values * (1 - dones_tensor_a)
-                    
-                    # IPPO: Normalizacja Advantage (Klucz do wydajności!)
-                    advantages = targets - values.detach()
-                    if advantages.shape[0] > 1:
-                        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                        
                 critic_loss = nn.MSELoss()(values, targets)
 
-                # policy forward
                 logits = self.policies[aid](states_tensor_a)
-                
-                # IPPO: Nakładanie Maski
                 mask_action = self.action_masks.get(aid, None)
                 if mask_action is not None:
                     logits = logits.masked_fill(~mask_action.unsqueeze(0), float("-inf"))
-                
-                # IPPO: Softmax przed Categorical
-                dist = torch.distributions.Categorical(probs=self.softmax(logits))
+                dist = torch.distributions.Categorical(logits=logits)
                 new_log_probs = dist.log_prob(actions_tensor_a.squeeze(1)).unsqueeze(1)
-                
                 ratios = torch.exp(new_log_probs - old_log_probs_tensor_a)
                 clipped_ratios = torch.clamp(ratios, 1 - self.clip_ratio, 1 + self.clip_ratio)
-                
-                # Używamy znormalizowanego advantages
-                surr1 = ratios * advantages
-                surr2 = clipped_ratios * advantages
-                policy_loss = -torch.min(surr1, surr2).mean()
-                
+                policy_loss = -torch.min(ratios * (targets - values.detach()), clipped_ratios * (targets - values.detach())).mean()
                 entropy = dist.entropy().mean()
 
                 batch_size_a = mask.sum().item()
@@ -279,44 +258,35 @@ class MAPPO(BaseLearningModel):
 
             if total_count == 0: continue
 
-            # average losses
             avg_critic_loss = total_critic_loss / total_count
             avg_policy_loss = total_policy_loss / total_count
             avg_entropy = total_entropy / total_count
 
-            # --- OPTYMALIZACJA (Z DODANYM CLIPPINGIEM Z IPPO) ---
-            
-            # update critic
             if isinstance(self.critic_optim, list):
                 for aid in unique_ids.tolist():
                     self.critic_optim[aid].zero_grad()
                 avg_critic_loss.backward()
                 for aid in unique_ids.tolist():
-                    torch.nn.utils.clip_grad_norm_(self.critics[aid].parameters(), max_norm=1.0)
                     self.critic_optim[aid].step()
             else:
                 self.critic_optim.zero_grad()
                 avg_critic_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.critics[0].parameters(), max_norm=1.0)
                 self.critic_optim.step()
-                
+            
             step_loss_critic.append(avg_critic_loss.item())
 
-            # update actor
             total_loss = avg_policy_loss - self.entropy_coef * avg_entropy
             if isinstance(self.actor_optimizer, list):
                 for aid in unique_ids.tolist():
                     self.actor_optimizer[aid].zero_grad()
                 total_loss.backward()
                 for aid in unique_ids.tolist():
-                    torch.nn.utils.clip_grad_norm_(self.policies[aid].parameters(), max_norm=1.0)
                     self.actor_optimizer[aid].step()
             else:
                 self.actor_optimizer.zero_grad()
                 total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.policies[0].parameters(), max_norm=1.0)
                 self.actor_optimizer.step()
-                
+            
             step_loss_actor.append(avg_policy_loss.item())
 
         if step_loss_critic:
@@ -609,36 +579,33 @@ def main():
     print_agent_counts(env)
     obs_size = env.observation_space(env.possible_agents[0]).shape[0]
     
-    # Set policies for machine agents
+    # Set policies for machine agents (Wspólny model)
     shared_action_space_size = max(agent.action_space_size for agent in env.machine_agents)
     agent_to_idx = {str(agent.id): idx for idx, agent in enumerate(env.machine_agents)}
     
     internal_action_masks = {}
-    for idx in range(len(env.machine_agents)):
-        agent = env.machine_agents[idx]
-        
-        mask = None
+    for idx, agent in enumerate(env.machine_agents):
+        mask_array = np.zeros(shared_action_space_size, dtype=np.bool_)
         if action_masks is not None:
-            key = (agent.origin, agent.destination)
+            key = (int(agent.origin), int(agent.destination))
             if key not in action_masks:
-                raise ValueError(
-                    f"Missing action mask for agent {agent.id} "
-                    f"({agent.origin} -> {agent.destination})."
-                )
-            mask = action_masks[key]
+                key = (agent.origin, agent.destination)
+            if key not in action_masks:
+                raise ValueError(f"Missing action mask for agent {agent.id}")
+            valid_mask = action_masks[key]
             
-        if mask is not None:
-            padded_mask = list(mask) + [0] * (shared_action_space_size - len(mask))
+            limit = min(len(valid_mask), shared_action_space_size)
+            mask_array[:limit] = valid_mask[:limit]
         else:
-            padded_mask = [1] * agent.action_space_size + [0] * (shared_action_space_size - agent.action_space_size)
+            mask_array[:agent.action_space_size] = True
             
-        internal_action_masks[idx] = torch.as_tensor(padded_mask, dtype=torch.bool, device=device)
-        
-        if not torch.any(internal_action_masks[idx]).item():
-            raise ValueError(f"Action mask for agent {agent.id} must contain at least one valid action.")
+        mask_array[agent.action_space_size:] = False
+        if not mask_array.any():
+            mask_array[0] = True
+            
+        internal_action_masks[idx] = torch.as_tensor(mask_array, dtype=torch.bool, device=device)
 
     model_params = params.copy()
-    
     model_params.update({
         "state_size": obs_size,
         "action_space_size": shared_action_space_size,
