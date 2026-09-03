@@ -85,7 +85,7 @@ class MAPPO(BaseLearningModel):
         self.entropy_coef = kwargs.get("entropy_coef", entropy_coef)
         self.value_coef = kwargs.get("value_coef", value_coef)
         self.batch_size = kwargs.get("batch_size", batch_size)
-        self.memory = deque(maxlen=kwargs.get("memory_size", memory_size))
+        self.memory = []
         self.last_states = {}
         self.last_actions = {}
         self.last_log_probs = {}
@@ -177,8 +177,14 @@ class MAPPO(BaseLearningModel):
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         with torch.no_grad():
             logits = self.policies[agent_id](state_tensor)
+            
+            if agent_id in self.action_masks:
+                mask = self.action_masks[agent_id]
+                logits = logits.masked_fill(~mask, float('-inf'))
+                
             dist = torch.distributions.Categorical(logits=logits)
             action = dist.sample().item() if self.training else torch.argmax(logits).item()
+            
         log_prob = dist.log_prob(torch.tensor(action, device=self.device)).item()
 
         self.last_states[agent_id] = state
@@ -186,114 +192,120 @@ class MAPPO(BaseLearningModel):
         self.last_log_probs[agent_id] = log_prob
         return action
 
-    def learn(
-        self,
-        states: list | None = None,
-        actions: list | None = None,
-        rewards: list | None = None,
-        old_log_probs: list | None = None,
-        next_states: list | None = None,
-        dones: list | None = None,
-        agent_ids: list | None = None
-    ):
-        if states is not None:
-            for s, a, r, lp, ns, d, aid in zip(states, actions, rewards, old_log_probs, next_states, dones, agent_ids):
-                self.memory.append((s, a, r, lp, ns, d, aid))
-
+    def learn(self):
+        # Aktualizacja tylko gdy mamy wystarczająco danych
         if len(self.memory) < self.batch_size: return
         
-        step_loss_actor = []
-        step_loss_critic = []
+        # PPO: Przetwarzamy całą zebraną pamięć (on-policy)
+        s_batch, a_batch, r_batch, lp_batch, ns_batch, d_batch, id_batch = zip(*self.memory)
+
+        # Używamy np.array by uniknąć problemów z powolnym tworzeniem tensorów z list
+        states_tensor = torch.FloatTensor(np.array(s_batch)).to(self.device)
+        actions_tensor = torch.LongTensor(a_batch).unsqueeze(1).to(self.device)
+        rewards_tensor = torch.FloatTensor(r_batch).unsqueeze(1).to(self.device)
+        next_states_tensor = torch.FloatTensor(np.array(ns_batch)).to(self.device)
+        old_log_probs_tensor = torch.FloatTensor(lp_batch).unsqueeze(1).to(self.device)
+        dones_tensor = torch.FloatTensor(d_batch).unsqueeze(1).to(self.device)
+        id_tensor = torch.LongTensor(id_batch)
+
+        unique_ids = id_tensor.unique().tolist()
+
+        # 1. KROK: OBLICZANIE ADVANTAGES I TARGETS (Ze starymi wartościami)
+        advantages = torch.zeros_like(rewards_tensor)
+        targets = torch.zeros_like(rewards_tensor)
+
+        with torch.no_grad():
+            for aid in unique_ids:
+                mask = (id_tensor == aid)
+                if not mask.any(): continue
+                
+                v = self.critics[aid](states_tensor[mask])
+                nv = self.critics[aid](next_states_tensor[mask])
+                
+                # Proste 1-step TD Target
+                td_target = rewards_tensor[mask] + self.gamma * nv * (1 - dones_tensor[mask])
+                adv = td_target - v
+                
+                advantages[mask] = adv
+                targets[mask] = td_target
+
+        # Normalizacja Advantages (krytyczne dla stabilności PPO)
+        adv_mean = advantages.mean()
+        adv_std = advantages.std() + 1e-8
+        advantages = (advantages - adv_mean) / adv_std
 
         for _ in range(self.num_epochs):
-            batch = random.sample(self.memory, self.batch_size)
-            s_batch, a_batch, r_batch, lp_batch, ns_batch, d_batch, id_batch = zip(*batch)
+            indices = np.arange(len(self.memory))
+            np.random.shuffle(indices)
 
-            states_tensor = torch.FloatTensor(np.array(s_batch)).to(self.device)
-            actions_tensor = torch.LongTensor(a_batch).unsqueeze(1).to(self.device)
-            rewards_tensor = torch.FloatTensor(r_batch).unsqueeze(1).to(self.device)
-            next_states_tensor = torch.FloatTensor(np.array(ns_batch)).to(self.device)
-            old_log_probs_tensor = torch.FloatTensor(lp_batch).unsqueeze(1).to(self.device)
-            dones_tensor = torch.FloatTensor(d_batch).unsqueeze(1).to(self.device)
+            for start in range(0, len(self.memory), self.batch_size):
+                end = start + self.batch_size
+                mb_idx = indices[start:end]
 
-            id_tensor = torch.LongTensor(id_batch)
-            unique_ids = id_tensor.unique()
+                mb_states = states_tensor[mb_idx]
+                mb_actions = actions_tensor[mb_idx]
+                mb_old_log_probs = old_log_probs_tensor[mb_idx]
+                mb_advantages = advantages[mb_idx]
+                mb_targets = targets[mb_idx]
+                mb_ids = id_tensor[mb_idx]
+                mb_unique_ids = mb_ids.unique().tolist()
 
-            total_policy_loss = 0.0
-            total_critic_loss = 0.0
-            total_entropy = 0.0
-            total_count = 0
+                avg_policy_loss, avg_critic_loss, avg_entropy = 0.0, 0.0, 0.0
+                total_count = len(mb_idx)
 
-            for aid in unique_ids.tolist():
-                mask = (id_tensor == aid)
-                states_tensor_a = states_tensor[mask]
-                actions_tensor_a = actions_tensor[mask]
-                rewards_tensor_a = rewards_tensor[mask]
-                next_states_tensor_a = next_states_tensor[mask]
-                old_log_probs_tensor_a = old_log_probs_tensor[mask]
-                dones_tensor_a = dones_tensor[mask]
+                for aid in mb_unique_ids:
+                    agent_mask = (mb_ids == aid)
+                    agent_count = agent_mask.sum().item()
 
-                values = self.critics[aid](states_tensor_a)
-                next_values = self.critics[aid](next_states_tensor_a)
-                with torch.no_grad():
-                    targets = rewards_tensor_a + self.gamma * next_values * (1 - dones_tensor_a)
-                critic_loss = nn.MSELoss()(values, targets)
+                    #critic
+                    v = self.critics[aid](mb_states[agent_mask])
+                    critic_loss = nn.MSELoss()(v, mb_targets[agent_mask])
 
-                logits = self.policies[aid](states_tensor_a)
-                mask_action = self.action_masks.get(aid, None)
-                if mask_action is not None:
-                    logits = logits.masked_fill(~mask_action.unsqueeze(0), float("-inf"))
-                dist = torch.distributions.Categorical(logits=logits)
-                new_log_probs = dist.log_prob(actions_tensor_a.squeeze(1)).unsqueeze(1)
-                ratios = torch.exp(new_log_probs - old_log_probs_tensor_a)
-                clipped_ratios = torch.clamp(ratios, 1 - self.clip_ratio, 1 + self.clip_ratio)
-                policy_loss = -torch.min(ratios * (targets - values.detach()), clipped_ratios * (targets - values.detach())).mean()
-                entropy = dist.entropy().mean()
+                    #actor
+                    logits = self.policies[aid](mb_states[agent_mask])
+                    
+                    if aid in self.action_masks:
+                        action_mask = self.action_masks[aid]
+                        logits = logits.masked_fill(~action_mask, float('-inf'))
+                        
+                    dist = torch.distributions.Categorical(logits=logits)
+                    new_log_probs = dist.log_prob(mb_actions[agent_mask].squeeze(1)).unsqueeze(1)
+                    entropy = dist.entropy().mean()
 
-                batch_size_a = mask.sum().item()
-                total_critic_loss += critic_loss * batch_size_a
-                total_policy_loss += policy_loss * batch_size_a
-                total_entropy += entropy * batch_size_a
-                total_count += batch_size_a
+                    ratios = torch.exp(new_log_probs - mb_old_log_probs[agent_mask])
+                    clipped_ratios = torch.clamp(ratios, 1 - self.clip_ratio, 1 + self.clip_ratio)
 
-            if total_count == 0: continue
+                    surr1 = ratios * mb_advantages[agent_mask]
+                    surr2 = clipped_ratios * mb_advantages[agent_mask]
+                    policy_loss = -torch.min(surr1, surr2).mean()
 
-            avg_critic_loss = total_critic_loss / total_count
-            avg_policy_loss = total_policy_loss / total_count
-            avg_entropy = total_entropy / total_count
+                    avg_critic_loss += critic_loss * (agent_count / total_count)
+                    avg_policy_loss += policy_loss * (agent_count / total_count)
+                    avg_entropy += entropy * (agent_count / total_count)
 
-            if isinstance(self.critic_optim, list):
-                for aid in unique_ids.tolist():
-                    self.critic_optim[aid].zero_grad()
-                avg_critic_loss.backward()
-                for aid in unique_ids.tolist():
-                    self.critic_optim[aid].step()
-            else:
-                self.critic_optim.zero_grad()
-                avg_critic_loss.backward()
-                self.critic_optim.step()
-            
-            step_loss_critic.append(avg_critic_loss.item())
+                if isinstance(self.critic_optim, list):
+                    for aid in mb_unique_ids: self.critic_optim[aid].zero_grad()
+                    avg_critic_loss.backward()
+                    for aid in mb_unique_ids: self.critic_optim[aid].step()
+                else:
+                    self.critic_optim.zero_grad()
+                    avg_critic_loss.backward()
+                    self.critic_optim.step()
 
-            total_loss = avg_policy_loss - self.entropy_coef * avg_entropy
-            if isinstance(self.actor_optimizer, list):
-                for aid in unique_ids.tolist():
-                    self.actor_optimizer[aid].zero_grad()
-                total_loss.backward()
-                for aid in unique_ids.tolist():
-                    self.actor_optimizer[aid].step()
-            else:
-                self.actor_optimizer.zero_grad()
-                total_loss.backward()
-                self.actor_optimizer.step()
-            
-            step_loss_actor.append(avg_policy_loss.item())
+                # Optymalizacja Aktora
+                total_loss = avg_policy_loss - self.entropy_coef * avg_entropy
+                if isinstance(self.actor_optimizer, list):
+                    for aid in mb_unique_ids: self.actor_optimizer[aid].zero_grad()
+                    total_loss.backward()
+                    for aid in mb_unique_ids: self.actor_optimizer[aid].step()
+                else:
+                    self.actor_optimizer.zero_grad()
+                    total_loss.backward()
+                    self.actor_optimizer.step()
 
-        if step_loss_critic:
-            self.loss_critic.append(sum(step_loss_critic) / len(step_loss_critic))
-        if step_loss_actor:
-            self.loss_actor.append(sum(step_loss_actor) / len(step_loss_actor))
-            
+                self.loss_critic.append(avg_critic_loss.item())
+                self.loss_actor.append(avg_policy_loss.item())
+
         self.memory.clear()
 
     def get_last_observation(self, agent_id: int):
