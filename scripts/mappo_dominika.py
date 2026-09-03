@@ -597,26 +597,27 @@ def main():
     
     internal_action_masks = {}
     for idx, agent in enumerate(env.machine_agents):
-        mask_array = np.zeros(shared_action_space_size, dtype=np.bool_)
         if action_masks is not None:
-            key = (int(agent.origin), int(agent.destination))
+            key = (agent.origin, agent.destination)
             if key not in action_masks:
-                key = (agent.origin, agent.destination)
+                key = (int(agent.origin), int(agent.destination))
+                
             if key not in action_masks:
                 raise ValueError(f"Missing action mask for agent {agent.id}")
+                
             valid_mask = action_masks[key]
+            mask_tensor = torch.as_tensor(valid_mask, dtype=torch.bool, device=device)
             
-            limit = min(len(valid_mask), shared_action_space_size)
-            mask_array[:limit] = valid_mask[:limit]
+            padded_mask = torch.zeros(shared_action_space_size, dtype=torch.bool, device=device)
+            limit = min(mask_tensor.size(0), shared_action_space_size)
+            padded_mask[:limit] = mask_tensor[:limit]
+            
+            internal_action_masks[idx] = padded_mask
         else:
-            mask_array[:agent.action_space_size] = True
+            mask_tensor = torch.zeros(shared_action_space_size, dtype=torch.bool, device=device)
+            mask_tensor[:agent.action_space_size] = True
+            internal_action_masks[idx] = mask_tensor
             
-        mask_array[agent.action_space_size:] = False
-        if not mask_array.any():
-            mask_array[0] = True
-            
-        internal_action_masks[idx] = torch.as_tensor(mask_array, dtype=torch.bool, device=device)
-
     model_params = params.copy()
     model_params.update({
         "state_size": obs_size,
