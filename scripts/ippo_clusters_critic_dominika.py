@@ -50,13 +50,16 @@ class PPO(BaseLearningModel):
 
         #Actor
         self.policy_net = Network(state_size, action_space_size, num_hidden, widths).to(self.device)
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
         self.softmax = nn.Softmax(dim=-1)
         
         #Critic
         self.value_net = Network(state_size, 1, num_hidden, widths).to(self.device)
-        self.value_optimizer = optim.Adam(self.value_net.parameters(), lr=lr)
         self.value_coef = 0.5
+        
+        self.optimizer = optim.Adam(
+            list(self.policy_net.parameters()) + list(self.value_net.parameters()), 
+            lr=lr
+        )
         
         self.loss = list()
         self.memory = list()
@@ -146,17 +149,16 @@ class PPO(BaseLearningModel):
             total_loss = actor_loss + self.value_coef * value_loss
 
             self.optimizer.zero_grad()
-            self.value_optimizer.zero_grad()
-            
             total_loss.backward()
             
-            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=1.0)
-            torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(
+                list(self.policy_net.parameters()) + list(self.value_net.parameters()), 
+                max_norm=1.0
+            )
             
             self.optimizer.step()
-            self.value_optimizer.step()
             
-            step_loss.append(actor_loss.item())
+            step_loss.append(total_loss.item())
 
         self.loss.append(sum(step_loss) / len(step_loss))
         self.memory.clear()
