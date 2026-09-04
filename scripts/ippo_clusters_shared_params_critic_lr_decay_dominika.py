@@ -44,8 +44,8 @@ class SharedPPO(BaseLearningModel):
     def __init__(self, state_size, action_space_size,
                  device="cpu", batch_size=16, lr=0.003, num_epochs=4,
                  num_hidden=2, widths=[32, 64, 32], clip_eps=0.2,
-                 normalize_advantage=True, entropy_coef=0.3,
-                 lr_decay=0.995, lr_min=1e-5):
+                 normalize_advantage=True, entropy_coef=0.3, value_coef=0.5,
+                 lr_decay=0.999, lr_min=1e-6):
         super().__init__()
         self.device = device
         self.action_space_size = action_space_size
@@ -54,13 +54,22 @@ class SharedPPO(BaseLearningModel):
         self.clip_eps = clip_eps
         self.normalize_advantage = normalize_advantage
         self.entropy_coef = entropy_coef
+        self.value_coef = value_coef
         self.lr_decay = lr_decay
         self.lr_min = lr_min
 
         self.policy_net = Network(
             state_size, action_space_size, num_hidden, widths
         ).to(self.device)
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
+        
+        self.critic_net = Network(
+            state_size, 1, num_hidden, widths
+        ).to(self.device)
+
+        self.optimizer = optim.Adam(
+            list(self.policy_net.parameters()) + list(self.critic_net.parameters()), 
+            lr=lr
+        )
         self.softmax = nn.Softmax(dim=-1)
 
         self.loss = []
@@ -189,15 +198,19 @@ class SharedPPO(BaseLearningModel):
 
             dist = self._distribution(states_tensor, action_masks_tensor)
             new_log_probs = dist.log_prob(actions_tensor)
+            
+            values = self.critic_net(states_tensor).squeeze(-1)
 
             ratio = torch.exp(new_log_probs - old_log_probs_tensor)
 
+            advantage_raw = rewards_tensor - values.detach()
+
             if self.normalize_advantage:
                 advantage = (
-                    rewards_tensor - rewards_tensor.mean()
-                ) / (rewards_tensor.std() + 1e-8)
+                    advantage_raw - advantage_raw.mean()
+                ) / (advantage_raw.std() + 1e-8)
             else:
-                advantage = rewards_tensor
+                advantage = advantage_raw
 
             surr1 = ratio * advantage
             surr2 = torch.clamp(
@@ -205,15 +218,16 @@ class SharedPPO(BaseLearningModel):
             ) * advantage
 
             entropy = dist.entropy().mean()
-            loss = (
-                -torch.min(surr1, surr2).mean()
-                - self.entropy_coef * entropy
-            )
+            
+            critic_loss = nn.MSELoss()(values, rewards_tensor)
+            loss = (-torch.min(surr1, surr2).mean() + self.value_coef * critic_loss - self.entropy_coef * entropy)
 
             self.optimizer.zero_grad()
             loss.backward()
+            
             torch.nn.utils.clip_grad_norm_(
-                self.policy_net.parameters(), max_norm=1.0
+                list(self.policy_net.parameters()) + list(self.critic_net.parameters()), 
+                max_norm=1.0
             )
             self.optimizer.step()
             step_loss.append(loss.item())
@@ -224,8 +238,8 @@ class SharedPPO(BaseLearningModel):
         
     def decay_lr(self):
         for param_group in self.optimizer.param_groups:
-            param_group['lr'] = max(self.lr_min, param_group['lr'] * self.lr_decay)
-
+            new_lr = max(self.lr_min, param_group['lr'] * self.lr_decay)
+            param_group['lr'] = new_lr
 
 # Main script to run the IPPO experiment
 if __name__ == "__main__":
@@ -522,6 +536,8 @@ if __name__ == "__main__":
         clip_eps=clip_eps,
         normalize_advantage=normalize_advantage,
         entropy_coef=entropy_coef,
+        lr_decay=params.get("lr_decay", 0.999),
+        lr_min=params.get("lr_min", 0.00001)
     )
 
     # Build one action mask per AV. This preserves the clustered-route masks
@@ -601,10 +617,10 @@ if __name__ == "__main__":
         if episode_losses:
             metrics["train/avg_loss"] = episode_losses[0]
         metrics["train/avg_entropy_coef"] = shared_model.entropy_coef
-        metrics["train/learning_rate"] = shared_model.optimizer.param_groups[0]['lr']
         metrics["train/reward_sum"] = float(np.sum(episode_rewards)) if episode_rewards else 0.0
         metrics["train/reward_mean"] = float(np.mean(episode_rewards)) if episode_rewards else 0.0
         metrics["train/travel_time_mean"] = float(np.mean(episode_travel_times)) if episode_travel_times else 0.0
+        metrics["train/learning_rate"] = shared_model.optimizer.param_groups[0]['lr']
 
         wandb.log(metrics)
 
@@ -615,6 +631,7 @@ if __name__ == "__main__":
 
     ### Testing phase ###
     shared_model.policy_net.eval()
+    shared_model.critic_net.eval()
     shared_model.deterministic = True
 
     pbar.set_description("Testing")
