@@ -11,17 +11,17 @@ import ast
 import json
 import logging
 import random
+import wandb
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import wandb
 
 from routerl         import TrafficEnvironment
 from tqdm            import tqdm
-from collections     import deque
+from collections     import deque, defaultdict
 
 from baseline_models import BaseLearningModel
 from iql             import Network
@@ -58,8 +58,10 @@ class MAPPO(BaseLearningModel):
         value_coef: float = 0.5,
         batch_size: int = 64,
         memory_size: int = 5000,
+        max_norm: float = 0.5,
         device: torch.device | None = None,
         action_mask: dict | None = None,
+        central_state_size: int | None = None,
         **kwargs
     ):
         super().__init__()
@@ -68,9 +70,16 @@ class MAPPO(BaseLearningModel):
         self.state_size = state_size
         self.action_space_size = action_space_size
         self.num_agents = num_agents
-        
-        # --- ZAPISANIE MASKI I PARAMETRÓW Z JSON ---
-        self.action_masks = kwargs.get("action_mask", {})
+        self.state_size = state_size
+        self.max_norm = max_norm
+        self.central_state_size = (
+        central_state_size
+            if central_state_size is not None
+            else state_size
+        )
+
+        self.last_central_states = {}
+        self.action_masks = action_mask if action_mask is not None else {}
         self.num_epochs = kwargs.get("num_epochs", 3)
         ws = kwargs.get("widths", default_widths)
         self.clip_ratio = kwargs.get("clip_eps", clip_ratio)
@@ -119,7 +128,14 @@ class MAPPO(BaseLearningModel):
             ch_ws = critic_arch_kwargs.get('widths', default_widths) if critic_arch_kwargs else default_widths
             self.critics = []
             for _ in range(num_agents):
-                net = Network(state_size, 1, len(ch_ws) - 1, ch_ws).to(self.device)
+                #net = Network(state_size, 1, len(ch_ws) - 1, ch_ws).to(self.device)
+                net = Network(
+                    self.central_state_size,
+                    1,
+                    len(ch_ws) - 1,
+                    ch_ws
+                ).to(self.device)
+
                 self.critics.append(net)
             if share_critic:
                 shared_critic = self.critics[0]
@@ -161,19 +177,21 @@ class MAPPO(BaseLearningModel):
             return
         if next_state is None:
             next_state = self.last_states[agent_id]
+        
         self.memory.append(
-            (
-                self.last_states.pop(agent_id),
-                self.last_actions.pop(agent_id),
-                float(reward),
-                self.last_log_probs.pop(agent_id),
-                next_state,
-                bool(done),
-                agent_id,
+        (
+            self.last_states.pop(agent_id),
+            self.last_central_states.pop(agent_id),
+            self.last_actions.pop(agent_id),
+            float(reward),
+            self.last_log_probs.pop(agent_id),
+            next_state,
+            bool(done),
+            agent_id,
             )
         )
 
-    def act(self, state: any, agent_id: int):
+    def act(self, state: any, agent_id: int, central_state=None):
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         with torch.no_grad():
             logits = self.policies[agent_id](state_tensor)
@@ -187,19 +205,34 @@ class MAPPO(BaseLearningModel):
             
         log_prob = dist.log_prob(torch.tensor(action, device=self.device)).item()
 
+        if central_state is None:
+            central_state = state
+
+        self.last_central_states[agent_id] = np.asarray(
+        central_state,
+        dtype=np.float32
+        )
+
         self.last_states[agent_id] = state
         self.last_actions[agent_id] = action
         self.last_log_probs[agent_id] = log_prob
+
         return action
 
     def learn(self):
-        # Aktualizacja tylko gdy mamy wystarczająco danych
         if len(self.memory) < self.batch_size: return
         
-        # PPO: Przetwarzamy całą zebraną pamięć (on-policy)
-        s_batch, a_batch, r_batch, lp_batch, ns_batch, d_batch, id_batch = zip(*self.memory)
+        (
+            s_batch,
+            cs_batch,
+            a_batch,
+            r_batch,
+            lp_batch,
+            ns_batch,
+            d_batch,
+            id_batch,
+        ) = zip(*self.memory)
 
-        # Używamy np.array by uniknąć problemów z powolnym tworzeniem tensorów z list
         states_tensor = torch.FloatTensor(np.array(s_batch)).to(self.device)
         actions_tensor = torch.LongTensor(a_batch).unsqueeze(1).to(self.device)
         rewards_tensor = torch.FloatTensor(r_batch).unsqueeze(1).to(self.device)
@@ -208,9 +241,12 @@ class MAPPO(BaseLearningModel):
         dones_tensor = torch.FloatTensor(d_batch).unsqueeze(1).to(self.device)
         id_tensor = torch.LongTensor(id_batch)
 
+        central_states_tensor = torch.FloatTensor(
+            np.array(cs_batch)
+        ).to(self.device)
+
         unique_ids = id_tensor.unique().tolist()
 
-        # 1. KROK: OBLICZANIE ADVANTAGES I TARGETS (Ze starymi wartościami)
         advantages = torch.zeros_like(rewards_tensor)
         targets = torch.zeros_like(rewards_tensor)
 
@@ -219,20 +255,13 @@ class MAPPO(BaseLearningModel):
                 mask = (id_tensor == aid)
                 if not mask.any(): continue
                 
-                v = self.critics[aid](states_tensor[mask])
-                nv = self.critics[aid](next_states_tensor[mask])
+                v = self.critics[aid](central_states_tensor[mask])
                 
-                # Proste 1-step TD Target
-                td_target = rewards_tensor[mask] + self.gamma * nv * (1 - dones_tensor[mask])
+                td_target = rewards_tensor[mask]
                 adv = td_target - v
                 
                 advantages[mask] = adv
                 targets[mask] = td_target
-
-        # Normalizacja Advantages (krytyczne dla stabilności PPO)
-        adv_mean = advantages.mean()
-        adv_std = advantages.std() + 1e-8
-        advantages = (advantages - adv_mean) / adv_std
 
         for _ in range(self.num_epochs):
             indices = np.arange(len(self.memory))
@@ -247,6 +276,7 @@ class MAPPO(BaseLearningModel):
                 mb_old_log_probs = old_log_probs_tensor[mb_idx]
                 mb_advantages = advantages[mb_idx]
                 mb_targets = targets[mb_idx]
+                mb_central_states = central_states_tensor[mb_idx]
                 mb_ids = id_tensor[mb_idx]
                 mb_unique_ids = mb_ids.unique().tolist()
 
@@ -258,7 +288,7 @@ class MAPPO(BaseLearningModel):
                     agent_count = agent_mask.sum().item()
 
                     #critic
-                    v = self.critics[aid](mb_states[agent_mask])
+                    v = self.critics[aid](mb_central_states[agent_mask])
                     critic_loss = nn.MSELoss()(v, mb_targets[agent_mask])
 
                     #actor
@@ -290,9 +320,12 @@ class MAPPO(BaseLearningModel):
                 else:
                     self.critic_optim.zero_grad()
                     avg_critic_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        self.critics[0].parameters(),
+                        max_norm=self.max_norm
+                    )
                     self.critic_optim.step()
 
-                # Optymalizacja Aktora
                 total_loss = avg_policy_loss - self.entropy_coef * avg_entropy
                 if isinstance(self.actor_optimizer, list):
                     for aid in mb_unique_ids: self.actor_optimizer[aid].zero_grad()
@@ -301,6 +334,10 @@ class MAPPO(BaseLearningModel):
                 else:
                     self.actor_optimizer.zero_grad()
                     total_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        self.policies[0].parameters(),
+                        max_norm=self.max_norm
+                    )
                     self.actor_optimizer.step()
 
                 self.loss_critic.append(avg_critic_loss.item())
@@ -339,7 +376,7 @@ def main():
     parser.add_argument("--shuffle", action="store_true", default=False)
     args = parser.parse_args()
     
-    ALGORITHM = "mappo_dominika"
+    ALGORITHM = "mappo"
     exp_id = args.id
     alg_config = args.alg_conf
     env_config = args.env_conf
@@ -411,7 +448,6 @@ def main():
     records_folder = f"../results/{exp_id}"
     plots_folder = f"../results/{exp_id}/plots"
 
-    # Read origin-destinations
     od_file_path = os.path.join(custom_network_folder, f"od_{network}.txt")
     with open(od_file_path, 'r', encoding='utf-8') as f:
         content = f.read()
@@ -518,14 +554,7 @@ def main():
     with open(exp_config_path, 'w', encoding='utf-8') as f:
         json.dump(dump_config, f, indent=4)
 
-    wandb.init(
-        # Set the wandb entity where your project will be logged (generally your team name).
-        entity="aintern26coexistence",
-        # Set the wandb project where this run will be logged.
-        project="PPO Enhancement",
-        name=exp_id,
-        config=dump_config
-    )
+ 
     
     # Initialize the environment
     env = TrafficEnvironment(
@@ -590,9 +619,15 @@ def main():
     env.mutation(disable_human_learning = not should_humans_adapt, mutation_start_percentile = -1)
     print_agent_counts(env)
     obs_size = env.observation_space(env.possible_agents[0]).shape[0]
+
     
-    # Set policies for machine agents (Wspólny model)
+    # Set policies for machine agents
     shared_action_space_size = max(agent.action_space_size for agent in env.machine_agents)
+    central_extra_size = shared_action_space_size + 1
+
+    central_state_size = (
+    obs_size + central_extra_size
+    )
     agent_to_idx = {str(agent.id): idx for idx, agent in enumerate(env.machine_agents)}
     
     internal_action_masks = {}
@@ -621,6 +656,7 @@ def main():
     model_params = params.copy()
     model_params.update({
         "state_size": obs_size,
+        "central_state_size": central_state_size,
         "action_space_size": shared_action_space_size,
         "num_agents": len(env.machine_agents),
         "shared_policy": True,
@@ -640,6 +676,14 @@ def main():
     pbar.set_description("AV learning")
     os.makedirs(plots_folder, exist_ok=True)
     for episode in range(training_eps):
+        od_route_counts = defaultdict(
+            lambda: np.zeros(
+            shared_action_space_size,
+            dtype=np.float32
+            )
+        )
+
+        num_avs_acted = 0
         env.reset()
         episode_rewards = []
         episode_travel_times = []
@@ -647,6 +691,7 @@ def main():
         for agent_id in env.agent_iter():
             observation, reward, termination, truncation, info = env.last()
             
+            acted_od = None
             if termination or truncation:
                 if agent_id in agent_lookup:
                     internal_id = agent_to_idx[str(agent_id)]
@@ -659,9 +704,63 @@ def main():
             else:
                 if agent_id in agent_lookup:
                     internal_id = agent_to_idx[str(agent_id)]
-                    action = shared_mappo.act(observation, agent_id=internal_id)
+                    machine = agent_lookup[agent_id]
+
+                    # OD pair of the current AV
+                    acted_od = (
+                    int(machine.origin),
+                    int(machine.destination)
+                    )
+
+                    # Previous route selections for this OD
+                    counts = od_route_counts[acted_od]
+
+                    if counts.sum() > 0:
+                        od_route_fractions = (
+                        counts / counts.sum()
+                         )
+                    else:
+                        od_route_fractions = np.zeros_like(
+                        counts,
+                        dtype=np.float32
+                        )
+
+                    # How far through the AV decisions we are
+                    progress = np.array(
+                        [
+                            num_avs_acted
+                            / max(len(env.machine_agents), 1)
+                        ],
+                        dtype=np.float32
+                    )
+
+                    # Centralized critic observation
+                    central_state = np.concatenate(
+                        [
+                            np.asarray(
+                                observation,
+                                dtype=np.float32
+                            ),
+                            od_route_fractions,
+                            progress,
+                        ]
+                    ).astype(np.float32)
+
+                    # Actor still receives ONLY local observation.
+                    # Critic information is passed separately.
+                    action = shared_mappo.act(
+                        observation,
+                        agent_id=internal_id,
+                        central_state=central_state
+                    )
+
+                    #action = shared_mappo.act(observation, agent_id=internal_id)
                 else:
                     action = None
+                
+                if acted_od is not None and action is not None:
+                    od_route_counts[acted_od][int(action)] += 1
+                    num_avs_acted += 1
                 
             env.step(action)
             
@@ -677,7 +776,6 @@ def main():
         metrics["train/reward_mean"] = float(np.mean(episode_rewards)) if episode_rewards else 0.0
         metrics["train/travel_time_mean"] = float(np.mean(episode_travel_times)) if episode_travel_times else 0.0
             
-        wandb.log(metrics)
         
         if episode % plot_every == 0:
             env.plot_results()
@@ -720,7 +818,8 @@ def main():
                 "testing/travel_time_sum": float(np.sum(episode_travel_times)) if episode_travel_times else 0.0,
             },
             step=human_learning_episodes + training_eps + episode,
-        )
+        )    
+       
         pbar.update()
     
     # Finalize the experiment
@@ -734,10 +833,8 @@ def main():
         if os.path.exists(plot_path):
             plot_name = f"plots/{plot_file.replace('.png', '')}"
             images_to_log[plot_name] = wandb.Image(plot_path)
-            
     if images_to_log:
         wandb.log(images_to_log)
-
     loss_records = [
         {"iteration": iteration, "agent_id": "shared", "loss": loss_value}
         for iteration, loss_value in enumerate(shared_mappo.loss_actor, start=1)
