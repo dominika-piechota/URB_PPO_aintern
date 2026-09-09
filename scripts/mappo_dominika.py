@@ -554,7 +554,14 @@ def main():
     with open(exp_config_path, 'w', encoding='utf-8') as f:
         json.dump(dump_config, f, indent=4)
 
- 
+    wandb.init(
+        # Set the wandb entity where your project will be logged (generally your team name).
+        entity="aintern26coexistence",
+        # Set the wandb project where this run will be logged.
+        project="PPO Enhancement",
+        name=exp_id,
+        config=dump_config
+    )
     
     # Initialize the environment
     env = TrafficEnvironment(
@@ -775,7 +782,7 @@ def main():
         metrics["train/reward_sum"] = float(np.sum(episode_rewards)) if episode_rewards else 0.0
         metrics["train/reward_mean"] = float(np.mean(episode_rewards)) if episode_rewards else 0.0
         metrics["train/travel_time_mean"] = float(np.mean(episode_travel_times)) if episode_travel_times else 0.0
-            
+        wandb.log(metrics)
         
         if episode % plot_every == 0:
             env.plot_results()
